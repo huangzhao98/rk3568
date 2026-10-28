@@ -1086,13 +1086,26 @@ class GstBE:
                 print(f"[gst] {err.message}", flush=True)
 
 
+def _adopt_detected_timings():
+    """漏边兜底：让驱动立即采纳芯片已检测到的时序。format_change 靠 SYNC/DE
+    中断边沿触发，芯片在驱动 probe 前已锁定（源一直稳定输出）时永远等不到
+    边沿，配置时序卡在默认 640x480，链路格式被钳死，720p 协商永远失败
+    （2026-10-28 实测：开机前源已输出/开机后插回同分辨率信号，gst 永久
+    Internal data stream error）。时序一致时 s_dv_timings 秒回无副作用；
+    内核 1Hz 轮询兜底之外，这里在配置失败时主动触发一次立即自愈。"""
+    sd = find_subdev()
+    if sd:
+        sh(f"v4l2-ctl -d {sd} --set-dv-bt-timings query 2>/dev/null")
+
+
 def _config_stream(cap, w, h):
     """配格式再开流。5.10 vb2_is_busy() 看的是已申请 buffer 数
     （不是是否在流）：只要 REQBUFS 过，S_FMT 就被 rkcif 以 queue busy
     拒绝——必须先 _free 释放 buffer 再配格式，配完 _alloc 重申请。
     S_FMT 可能静默失败（sh 不看退出码），必须回读确认——否则驱动
     停在 640x480/RG10 默认格式（format_change 会把节点格式重置回默认），
-    帧照流但内容是垃圾（绿屏/空帧）。"""
+    帧照流但内容是垃圾（绿屏/空帧）。回读确认失败时先补一次漏边兜底
+    （采纳检测时序）再重试一轮。"""
     if cap.be_name == 'gst':
         # gst 路径：链路基元格式仍要 media-ctl 配好（同原生）；S_FMT 由
         # v4l2src 进 PLAYING 时按 caps 过滤器完成，故整管线重建再开流，
@@ -1100,27 +1113,39 @@ def _config_stream(cap, w, h):
         # 不走 stream_off：对 NULL 态管线 set PAUSED 会让 v4l2src 白白
         # 提前打开设备；free(NULL) 的 close→重建→PLAYING 已覆盖
         # "关流解静音→重开流"的对齐语义
+        for attempt in range(2):
+            for ent in ('m00_b_tc35874x 4-000f:0', 'rockchip-csi2-dphy0:0', 'rockchip-csi2-dphy0:1',
+                        'rockchip-mipi-csi2:0', 'rockchip-mipi-csi2:4'):
+                sh(f"media-ctl -d /dev/media0 --set-v4l2 '\"{ent}\"[fmt:UYVY8_2X8/{w}x{h}]'")
+            cap._gst.build(w, h)
+            cap.stream_on()
+            time.sleep(0.5)          # S_FMT 发生在开流瞬间，回读前等一拍
+            fmt = sho("v4l2-ctl -d /dev/video0 --get-fmt-video 2>/dev/null")
+            # v4l2src 节点格式是 NV12（UYVY 由 videoconvert 在管线内软转）
+            if f"{w}/{h}" in fmt and "'NV12'" in fmt:
+                return True
+            if attempt == 0:
+                print("[config] fmt confirm failed, adopt detected timings "
+                      "and retry", flush=True)
+                _adopt_detected_timings()
+        return False
+    for attempt in range(2):
+        cap.stream_off()
+        cap._free()
         for ent in ('m00_b_tc35874x 4-000f:0', 'rockchip-csi2-dphy0:0', 'rockchip-csi2-dphy0:1',
                     'rockchip-mipi-csi2:0', 'rockchip-mipi-csi2:4'):
             sh(f"media-ctl -d /dev/media0 --set-v4l2 '\"{ent}\"[fmt:UYVY8_2X8/{w}x{h}]'")
-        cap._gst.build(w, h)
-        cap.stream_on()
-        time.sleep(0.5)          # S_FMT 发生在开流瞬间，回读前等一拍
+        sh(f"v4l2-ctl -d /dev/video0 --set-fmt-video=width={w},height={h},pixelformat=UYVY")
         fmt = sho("v4l2-ctl -d /dev/video0 --get-fmt-video 2>/dev/null")
-        # v4l2src 节点格式是 NV12（UYVY 由 videoconvert 在管线内软转）
-        return f"{w}/{h}" in fmt and "'NV12'" in fmt
-    cap.stream_off()
-    cap._free()
-    for ent in ('m00_b_tc35874x 4-000f:0', 'rockchip-csi2-dphy0:0', 'rockchip-csi2-dphy0:1',
-                'rockchip-mipi-csi2:0', 'rockchip-mipi-csi2:4'):
-        sh(f"media-ctl -d /dev/media0 --set-v4l2 '\"{ent}\"[fmt:UYVY8_2X8/{w}x{h}]'")
-    sh(f"v4l2-ctl -d /dev/video0 --set-fmt-video=width={w},height={h},pixelformat=UYVY")
-    fmt = sho("v4l2-ctl -d /dev/video0 --get-fmt-video 2>/dev/null")
-    cap.realloc()                    # 无论成败都按当前节点格式重申请 buffer
-    if f"{w}/{h}" not in fmt or "'UYVY'" not in fmt:
-        return False
-    cap.stream_on()
-    return True
+        cap.realloc()                    # 无论成败都按当前节点格式重申请 buffer
+        if f"{w}/{h}" in fmt and "'UYVY'" in fmt:
+            cap.stream_on()
+            return True
+        if attempt == 0:
+            print("[config] fmt confirm failed, adopt detected timings "
+                  "and retry", flush=True)
+            _adopt_detected_timings()
+    return False
 
 
 

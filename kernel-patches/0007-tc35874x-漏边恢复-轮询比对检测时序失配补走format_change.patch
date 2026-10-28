@@ -1,0 +1,71 @@
+From dd60f4c5c5407ca1fa2e735c714d9c068c9eb887 Mon Sep 17 00:00:00 2001
+From: huangzhao <huangzhao@WIN-TLG0U98OLAE>
+Date: Wed, 28 Oct 2026 19:20:53 +0800
+Subject: [PATCH] =?UTF-8?q?tc35874x:=20=E6=BC=8F=E8=BE=B9=E6=81=A2?=
+ =?UTF-8?q?=E5=A4=8D=20=E2=80=94=20=E8=BD=AE=E8=AF=A2=E6=AF=94=E5=AF=B9?=
+ =?UTF-8?q?=E6=A3=80=E6=B5=8B=E6=97=B6=E5=BA=8F=EF=BC=8C=E5=A4=B1=E9=85=8D?=
+ =?UTF-8?q?=E8=A1=A5=E8=B5=B0=20format=5Fchange?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+format_change 靠 SYNC/DE 中断边沿触发；芯片在驱动 probe 前已锁定
+（源一直稳定输出）或插线边沿丢失时永远等不到边沿，state->timings
+停在默认 640x480，链路格式被钳死，720p 协商永久失败（2026-10-28
+实测：开机前源已输出/开机后插回同分辨率信号，gst 每 5s 报
+Internal data stream error 死循环，重启服务也救不回）。
+
+i2c 轮询（无 IRQ 线，200ms）里每 ~1s 比对检测时序与配置时序，
+失配补走 format_change（与中断同入口：重编程+延迟解静音钉相位）。
+板上实测：人为把配置时序写成 640x480，3s 内自动恢复 720p。
+---
+ drivers/media/i2c/tc35874x.c | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/i2c/tc35874x.c b/drivers/media/i2c/tc35874x.c
+index 23798eb1b..51a7da6c6 100644
+--- a/drivers/media/i2c/tc35874x.c
++++ b/drivers/media/i2c/tc35874x.c
+@@ -213,6 +213,7 @@ struct tc35874x_state {
+ 
+ 	struct timer_list timer;
+ 	struct work_struct work_i2c_poll;
++	unsigned int poll_ticks;	/* 漏边恢复节流计数（见 work_i2c_poll） */
+ 
+ 	/* edid  */
+ 	u8 edid_blocks_written;
+@@ -1675,9 +1676,30 @@ static void tc35874x_work_i2c_poll(struct work_struct *work)
+ {
+ 	struct tc35874x_state *state = container_of(work,
+ 			struct tc35874x_state, work_i2c_poll);
++	struct v4l2_subdev *sd = &state->sd;
+ 	bool handled;
+ 
+-	tc35874x_isr(&state->sd, 0, &handled);
++	tc35874x_isr(sd, 0, &handled);
++
++	/* CCS 漏边恢复：format_change 由 SYNC/DE 变化中断边沿触发。若芯片在
++	 * 驱动 probe 前已锁定（源一直在输出），之后全程无跳变就永远等不到
++	 * 边沿——state->timings 停在默认 640x480，链路格式被钳死，应用层
++	 * 按真实分辨率（如 720p）配流永远协商失败（2026-10-28 实测：开机前
++	 * 源已稳定输出时 gst 永久 Internal data stream error；开机没插线、
++	 * 之后插回同分辨率信号亦同）。轮询兜底：锁定状态下每 ~1s 比对一次
++	 * 检测时序与配置时序，不一致就补走 format_change（与中断路径同一
++	 * 入口，语义一致：失配 → enable_stream(false)+s_dv_timings 重编程，
++	 * 相位仍由延迟解静音钉定；一致则只读几个寄存器，无副作用）。
++	 * i2c 挂死时 no_signal/no_sync 为真直接跳过。 */
++	if (++state->poll_ticks >= 5) {
++		struct v4l2_dv_timings det;
++
++		state->poll_ticks = 0;
++		if (!no_signal(sd) && !no_sync(sd) &&
++		    !tc35874x_get_detected_timings(sd, &det) &&
++		    !v4l2_match_dv_timings(&state->timings, &det, 0, false))
++			tc35874x_format_change(sd);
++	}
+ }
+ 
+ static int tc35874x_subscribe_event(struct v4l2_subdev *sd, struct v4l2_fh *fh,
+-- 
+2.43.0
+
