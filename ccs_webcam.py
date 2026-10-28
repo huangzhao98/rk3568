@@ -1648,6 +1648,23 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
             last_km = None               # 上一帧测量 (k, via)
             k, conf, m = 0, False, 'none'
             bootstrap = cap.ref is None and _pinned_roll(w, h) is None
+            if bootstrap and not hpd_done and tc:
+                # bootstrap（量产首烧/状态丢失）：瞬态帧的 split 假阳性会污染
+                # 钉值+参考帧（2026-10-28 实测首烧 split 报 695 真值 0，随后
+                # 全链路被带歪），不如跳过测量直接干净重锁锚 0——确定性，
+                # 还省掉 15s 测量窗口。重锁失败（源不理会 HPD）才落回测量链
+                hpd_done = True
+                print("[align] bootstrap: 跳过瞬态测量，直接干净重锁锚定相位 0",
+                      flush=True)
+                relocked = _hpd_clean_relock(tc)
+                if relocked:
+                    cap.ref = None
+                    for p in (ROLL_PATH, REF_PATH):
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+                continue
             win = 20 if relocked else 15
             # 有参考帧（热拔插恢复等）时内容稳定门限 10→3 帧：ref 全帧相关
             # 本身即强校验，热拔插路径对齐 3s→~1s，对标树莓派恢复速度
@@ -2666,16 +2683,21 @@ def main():
                 if cap.need_realign.is_set():
                     cap.need_realign.clear()
                     # 信号恢复/链路抖动自愈走快速通道（2026-10-28，对标树莓派
-                    # 热拔插 1~2s）：驱动的延迟解静音已保证重建相位为 0=钉值，
+                    # 热拔插 1~2s）：驱动的延迟解静音已保证重建相位为 0，
                     # 挡住画面做对齐仪式（实测 3~5s）纯属浪费。直接重启流水线
                     # 按钉值出图，track 每 150 帧后台复测，万一相位真变了 ~4s
                     # 内自愈纠正。仅 /realign 按钮、管线切换（reopen 后相位真
                     # 随机）、分辨率变化（参考帧作废）和无钉值（bootstrap）
-                    # 走完整对齐
+                    # 走完整对齐。
+                    # 注意：仅钉值=0 时可快进——钉值非 0 说明上次对齐时源不理会
+                    # HPD（重锁失败走了测量链），信号恢复后的相位没有 0 保证，
+                    # 按旧钉值快进可能把画面带歪（2026-10-28 实测：钉值被首烧
+                    # 瞬态的 split 假阳性污染成 121，重锁后相位已归 0，快进
+                    # 应用旧钉值反而卷动）
                     forced = cap.realign_forced
                     cap.realign_forced = False
                     kp = None if forced else _pinned_roll(cap.w, cap.h)
-                    if kp is not None:
+                    if kp == 0:
                         subdev = find_subdev()
                         geo0 = (cap.w, cap.h)
                         _follow_source(cap, subdev)
