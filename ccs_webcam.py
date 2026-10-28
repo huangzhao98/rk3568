@@ -612,6 +612,7 @@ class Capture:
         self._blut = None          # 亮度 LUT，100 时为 None（零开销直通）
         self.sharp = 0             # 锐化强度 0~100（0=关闭；VGA 采样模糊的补偿）
         self.need_realign = threading.Event()
+        self.realign_forced = False  # /realign 按钮/管线切换置位：绕过快速通道走完整对齐
         self._track_frame = None   # 已投递给 track 子进程的帧（回写 ref 用）
         self.in_align = threading.Event()   # 对齐期间屏蔽 watchdog（信号变化是自己造成的）
         self.roll = 0              # 硬件卷动相位：buffer 第 b 行 = 源画面第 (b+roll)%h 行
@@ -1648,6 +1649,10 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
             k, conf, m = 0, False, 'none'
             bootstrap = cap.ref is None and _pinned_roll(w, h) is None
             win = 20 if relocked else 15
+            # 有参考帧（热拔插恢复等）时内容稳定门限 10→3 帧：ref 全帧相关
+            # 本身即强校验，热拔插路径对齐 3s→~1s，对标树莓派恢复速度
+            # （2026-10-28 实测）；bootstrap 无校验手段，维持 10 帧保守
+            stable_gate = 10 if bootstrap else 3
             while time.time() - t0 < win:
                 f = cap.grab_latest(timeout=4)
                 if f is None:
@@ -1665,7 +1670,7 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                     stable = 0
                     last_km = None
                     continue
-                if stable < 10:
+                if stable < stable_gate:
                     continue
                 k2, conf2, m2 = _measure_phase(raw, recent, cap.ref, w, h,
                                                bootstrap)
@@ -1792,6 +1797,7 @@ def _switch_backend(cap):
     finally:
         cap.want_be = cap.be_name
         cap.in_align.clear()
+    cap.realign_forced = True      # 管线重开后相位真随机，必须完整对齐
     cap.need_realign.set()
 
 
@@ -2032,7 +2038,7 @@ const ov=document.getElementById('vsig');
 if(t.includes('aligning')||t.includes('| init |')){ov.textContent='对齐中…';ov.style.display='flex';}
 else if(t.includes('无视频输入信号')){ov.textContent='无视频输入信号';ov.style.display='flex';}
 else ov.style.display='none';
-}catch(e){}},2000);
+}catch(e){}},1000);
 
 // ---- GPIO 免刷新操作：整页跳转会把折叠块收起、滚动条拉回顶部 ----
 async function gpioSet(num,val,btn){
@@ -2659,6 +2665,31 @@ def main():
                     continue
                 if cap.need_realign.is_set():
                     cap.need_realign.clear()
+                    # 信号恢复/链路抖动自愈走快速通道（2026-10-28，对标树莓派
+                    # 热拔插 1~2s）：驱动的延迟解静音已保证重建相位为 0=钉值，
+                    # 挡住画面做对齐仪式（实测 3~5s）纯属浪费。直接重启流水线
+                    # 按钉值出图，track 每 150 帧后台复测，万一相位真变了 ~4s
+                    # 内自愈纠正。仅 /realign 按钮、管线切换（reopen 后相位真
+                    # 随机）、分辨率变化（参考帧作废）和无钉值（bootstrap）
+                    # 走完整对齐
+                    forced = cap.realign_forced
+                    cap.realign_forced = False
+                    kp = None if forced else _pinned_roll(cap.w, cap.h)
+                    if kp is not None:
+                        subdev = find_subdev()
+                        geo0 = (cap.w, cap.h)
+                        _follow_source(cap, subdev)
+                        if (cap.w, cap.h) == geo0 and has_signal(subdev):
+                            print(f"[align] fast resume: pinned roll={kp}, "
+                                  f"skip blocking align", flush=True)
+                            cap.roll = kp
+                            cap.align_conf, cap.align_via = True, 'fast'
+                            cap.state = "streaming"
+                            cap.last_frame_ts = time.time()
+                            _config_stream(cap, cap.w, cap.h)
+                            raw = None
+                            empty = 0
+                            continue
                     raw = align_and_start(cap, find_subdev(), args.width, args.height)
                     empty = 0
                     continue
@@ -3018,6 +3049,7 @@ http://{form.get('addr', '').split('/')[0]}:{args.port}/net_confirm?token={token
                 except (KeyError, OSError, ValueError) as e:
                     self._send(500, f'串口不可用: {e}', 'text/plain; charset=utf-8')
             elif path == '/realign':
+                cap.realign_forced = True   # 用户目视到卷动才按：必须完整对齐，绕过快速通道
                 cap.need_realign.set()      # 测不出时 align 会自动干净重锁
                 self._redirect(msg='已触发重对齐')
             elif path == '/nudge':

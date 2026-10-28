@@ -1,0 +1,86 @@
+From 9da9068a7fdb81e422a805aaa6df6d7ed1e10754 Mon Sep 17 00:00:00 2001
+From: huangzhao <huangzhao@WIN-TLG0U98OLAE>
+Date: Wed, 28 Oct 2026 17:46:30 +0800
+Subject: [PATCH] =?UTF-8?q?tc35874x:=20=E7=83=AD=E6=8B=94=E6=8F=92?=
+ =?UTF-8?q?=E6=81=A2=E5=A4=8D=E6=8F=90=E9=80=9F=E5=AF=B9=E6=A0=87=E6=A0=91?=
+ =?UTF-8?q?=E8=8E=93=E6=B4=BE=20=E2=80=94=20=E5=A4=B1=E9=94=81/=E7=AD=89?=
+ =?UTF-8?q?=E9=94=81=E8=BD=AE=E8=AF=A21Hz=E2=86=924Hz,=20=E7=A8=B3?=
+ =?UTF-8?q?=E5=AE=9A=E9=94=81=E5=AE=9A=E7=AD=89=E5=BE=854s=E2=86=921s,=20I?=
+ =?UTF-8?q?SR=E8=BD=AE=E8=AF=A21s=E2=86=92200ms?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+物理拔插后源端从帧头重新出图, 1s 干净稳定锁定即可保证相位 0,
+整机恢复时间从 ~6s 压到 ~1.5s; 开机相位对齐有应用层机制兜底。
+---
+ drivers/media/i2c/tc35874x.c | 22 +++++++++++++---------
+ 1 file changed, 13 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/media/i2c/tc35874x.c b/drivers/media/i2c/tc35874x.c
+index c60f6f912..23798eb1b 100644
+--- a/drivers/media/i2c/tc35874x.c
++++ b/drivers/media/i2c/tc35874x.c
+@@ -69,7 +69,8 @@ MODULE_LICENSE("GPL");
+ #define I2C_MAX_XFER_SIZE  (EDID_BLOCK_SIZE + 2)
+ 
+ #define POLL_INTERVAL_CEC_MS	10
+-#define POLL_INTERVAL_MS	1000
++/* CCS 对标树莓派热拔插恢复速度：5V/时序变化检测 1000→200ms */
++#define POLL_INTERVAL_MS	200
+ 
+ /* PIXEL_RATE = MIPI_FREQ * 2 * lane / 8bit */
+ #define TC35874X_LINK_FREQ_310MHZ	310000000
+@@ -728,12 +729,15 @@ static void tc35874x_self_reset(struct tc35874x_state *state)
+ 	state->i2c_errs = 0;
+ }
+ 
+-/* CCS 延迟解静音监控（自续 1Hz，开流期间常驻）：
++/* CCS 延迟解静音监控（自续轮询，开流期间常驻）：
+  * VI_MUTE 解静音瞬间 CSI TX 会以当时的输入同步位置重建帧结构，
+  * 若恰逢锁定瞬态的垃圾同步，相位就是随机的（画面垂直卷动的根源）。
+  * 这里在失锁/未锁期间按住强制静音（AUTO_MUTE 不会在瞬态建帧），
+- * 等 TMDS 连续锁定稳定 4s 后才解除强制静音，让帧结构在干净锁定下
+- * 重建——实测相位收敛到常数 C0=0（2026-10-26，5/5）。 */
++ * 等 TMDS 连续锁定稳定 1s 后才解除强制静音，让帧结构在干净锁定下
++ * 重建——实测相位收敛到常数 C0=0（2026-10-26，5/5）。
++ * 2026-10-28 对标树莓派热拔插 1~2s 恢复：失锁/等锁期间轮询
++ * HZ→HZ/4，稳定等待 4s→1s（热拔插后源从帧头重新出图，1s 稳定
++ * 已足够确认干净锁定；开机的相位对齐有应用层机制兜底）。 */
+ static void tc35874x_work_unmute(struct work_struct *work)
+ {
+ 	struct tc35874x_state *state = container_of(to_delayed_work(work),
+@@ -773,14 +777,14 @@ static void tc35874x_work_unmute(struct work_struct *work)
+ 		} else {
+ 			state->nosync_since = 0;
+ 		}
+-		schedule_delayed_work(&state->work_unmute, HZ);
++		schedule_delayed_work(&state->work_unmute, HZ / 4);
+ 		return;
+ 	}
+ 	state->nosync_since = 0;
+ 	if (!state->lock_since)
+ 		state->lock_since = jiffies;
+-	if (time_before(jiffies, state->lock_since + 4 * HZ)) {
+-		schedule_delayed_work(&state->work_unmute, HZ / 2);
++	if (time_before(jiffies, state->lock_since + 1 * HZ)) {
++		schedule_delayed_work(&state->work_unmute, HZ / 4);
+ 		return;
+ 	}
+ 	if (i2c_rd8(sd, VI_MUTE) & MASK_VI_MUTE) {
+@@ -807,10 +811,10 @@ static inline void enable_stream(struct v4l2_subdev *sd, bool enable)
+ 		/* CCS 延迟解静音：不立即解。锁定瞬态的同步位置是垃圾，
+ 		 * 此时建帧相位随机（卷动根源）。按住强制静音，交给
+ 		 * work_unmute 等锁定稳定后再解，相位钉回常数。
+-		 * 信号可能早已锁好，4s 保守等待从此刻起算。 */
++		 * 信号可能早已锁好，1s 稳定等待从此刻起算。 */
+ 		i2c_wr8(sd, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
+ 		state->lock_since = jiffies;
+-		schedule_delayed_work(&state->work_unmute, HZ / 2);
++		schedule_delayed_work(&state->work_unmute, HZ / 4);
+ 	} else {
+ 		/* Mute video so that all data lanes go to LSP11 state.
+ 		 * No data is output to CSI Tx block. */
+-- 
+2.43.0
+
