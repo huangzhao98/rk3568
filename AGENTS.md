@@ -34,17 +34,18 @@ systemd 服务 `ccs_webcam.service`）。
      等效快速拔插一次；内容识别（taskbar/band/seam）只做辅助，重锁后
      偏离 0 超 10 行判假阳性
    - 持久化：`/var/lib/ccs_roll`（w h k）+ `/var/lib/ccs_ref.raw` 参考帧；
-     常态开机 ref 命中 3~5s 完成；首烧 bootstrap ~40s（15s 测量 + 11s
-     重锁 + ~12s 复核，复核有提前退出）
+     常态开机驱动 HPD 门控放行后 1~2s 采信锚点（via=gated，见 §23）
    - 网页 `/realign` 按钮走同一机制，手动触发
 2. **网页 1s 可开**：首次对齐挪进采集线程，不再阻塞 HTTP 绑定
 3. **网页状态遮罩**：断线提示"无视频输入信号"，对齐中显示"对齐中…"
    （JS 2s 轮询 /stat，aligning 优先于无信号；sig_ok 看门狗每拍更新）
-4. **内核 tc35874x 驱动**（7 个 commit，见 kernel-patches/）：
+4. **内核 tc35874x 驱动**（9 个 commit，见 kernel-patches/）：
    HUB 供电识别、相位固定、延迟解静音、i2c 挂死自救、
    TMDS 在而 SYNC 超 60s 自救复位、热拔插提速、漏边恢复
    （芯片先于驱动锁定时轮询比对补走 format_change，否则时序
-   卡死 640x480，见存档 §21）
+   卡死 640x480，见存档 §21）、HPD 门控（probe 起按住源端，
+   应用层 set_fmt/s_stream 才放行，冷启动相位恒 0，对齐 ~5s，
+   见存档 §23）
 5. **性能**：采集 60fps 满帧（实测），编码输出 ~45fps（RGA 缩放+硬编
    ~22ms/帧，信箱丢中间帧，不是采集问题）
 
@@ -68,6 +69,6 @@ systemd 服务 `ccs_webcam.service`）。
 1. `git clone git@github.com:huangzhao98/rk3568.git`（本仓库）
 2. `git clone git@github.com:huangzhao98/rk3568-kernel.git`（内核完整源码）
 3. 完整 SDK（几十个 GB，repo 管理）不在 GitHub 上，需要的话从原开发机
-   拷贝或用 rockchip 官方渠道重新同步，然后把 kernel-patches/ 里 7 个
+   拷贝或用 rockchip 官方渠道重新同步，然后把 kernel-patches/ 里 9 个
    补丁 `git am` 到 SDK 的 kernel 目录
 4. 读 `README_开发流程.md`、`61_文件地图.md` 建立全局认识

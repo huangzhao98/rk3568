@@ -1649,8 +1649,39 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                 print("[align] deadline 150s, abort", flush=True)
                 break
             cap.state = f"aligning#{attempt + 1}"
+            clean_start = False          # 门控放行后源才出图：相位被驱动钉 0
             if subdev and not has_signal(subdev):
-                break                        # 无信号帧不可能来，快速失败等看门狗
+                # 驱动 HPD 门控：冷启动按住源端（HPD 低），应用层开始配置
+                # 采集（subdev set_fmt/s_stream）才放行——源从帧边界重启出图，
+                # 配合驱动延迟解静音相位恒 0，无需测量直接快速采信锚点。
+                # 这里先戳一下 subdev 配格式触发放行再等信号；等不到 =
+                # 真没插线或旧内核，放弃本轮走原逻辑（看门狗兜底）
+                # 实测：media-ctl --set-v4l2 在未配格式的链路上前置校验
+                # 失败（EINVAL），根本触达不到驱动；v4l2-ctl --set-subdev-fmt
+                # 直接 ioctl subdev 节点，驱动 set_fmt 完整执行、门控放行。
+                # （rc=255 是 v4l2-ctl 写后回读验证失败——get_fmt 报的是
+                # 驱动 state->timings 默认 640x480，无害，驱动侧已生效）
+                sh(f"v4l2-ctl -d {subdev} --set-subdev-fmt "
+                   f"pad=0,width={w},height={h},code=0x2006")
+                t_gate = time.time()
+                while time.time() - t_gate < 12 and time.time() < t_deadline:
+                    if has_signal(subdev):
+                        clean_start = True
+                        break
+                    time.sleep(0.5)
+                if not clean_start:
+                    break
+                _adopt_detected_timings()   # 门控期间无时序可采，放行后补采
+                print("[align] 门控放行后信号到来：源从帧头出图，快速采信",
+                      flush=True)
+            elif _pinned_roll(cap.w, cap.h) == 0:
+                # 服务重启（门控早已放行、信号一直在）：驱动 1Hz tick 边界解
+                # 静音保证相位不变，钉值 0 直接可信，走门控同一快速采信——
+                # 实测热重启走 6s 测量窗在无特征画面上必落空，再搭 12s 重锁
+                # （20:52 实测全程 ~20s）；相位本来就没变，纯属浪费。仅钉值
+                # =0 可快进：非 0 说明上次源不理会 HPD，相位无 0 保证
+                clean_start = True
+                print("[align] 热启动+钉值0：相位不变，快速采信", flush=True)
             _follow_source(cap, subdev)      # 源切了分辨率就跟过去（如强制 1080p）
             w, h = cap.w, cap.h
             if cap.ref is None:
@@ -1674,7 +1705,7 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
             last_km = None               # 上一帧测量 (k, via)
             k, conf, m = 0, False, 'none'
             bootstrap = cap.ref is None and _pinned_roll(w, h) is None
-            if bootstrap and not hpd_done and tc:
+            if bootstrap and not hpd_done and tc and not clean_start:
                 # bootstrap（量产首烧/状态丢失）：瞬态帧的 split 假阳性会污染
                 # 钉值+参考帧（2026-10-28 实测首烧 split 报 695 真值 0，随后
                 # 全链路被带歪），不如跳过测量直接干净重锁锚 0——确定性，
@@ -1691,29 +1722,64 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                         except OSError:
                             pass
                 continue
-            win = 20 if relocked else 6
-            # 有参考帧（热拔插恢复等）时内容稳定门限 10→3 帧：ref 全帧相关
-            # 本身即强校验，热拔插路径对齐 3s→~1s，对标树莓派恢复速度
-            # （2026-10-28 实测）；bootstrap 无校验手段，维持 10 帧保守
-            stable_gate = 10 if bootstrap else 3
+            win = 20 if (relocked or clean_start) else 6
+            # 有参考帧（热拔插恢复等）或门控放行（相位已被驱动钉 0）时内容
+            # 稳定门限 10→3 帧：ref 全帧相关/驱动钉定本身即强校验
+            # （2026-10-28 实测热拔插对齐 3s→~1s，对标树莓派）；
+            # 裸 bootstrap 无校验手段，维持 10 帧保守
+            stable_gate = 10 if (bootstrap and not clean_start) else 3
             while time.time() - t0 < win:
                 f = cap.grab_latest(timeout=4)
                 if f is None:
                     none_streak += 1
+                    print(f"[align] dbg: no frame streak={none_streak}",
+                          flush=True)
                     if none_streak >= 5:             # ~20s 无一帧 → 放弃本轮
                         break
                     continue
                 none_streak = 0
                 cap.last_frame_ts = time.time()
-                if _row_profile(f, w, h).max() > 30:
+                rp = _row_profile(f, w, h).max()
+                if rp > 30:
                     stable += 1
                     raw = f
                     recent = (recent + [f])[-3:]
                 else:
+                    print(f"[align] dbg: unstable rp={rp}", flush=True)
                     stable = 0
                     last_km = None
                     continue
+                if clean_start:
+                    print(f"[align] dbg: cs stable={stable} gate={stable_gate}",
+                          flush=True)
                 if stable < stable_gate:
+                    continue
+                if clean_start:
+                    # 门控快速路径：相位已被驱动钉 0，split/ref 只做 sanity
+                    # ——两帧一致的非零结果才推翻锚点；门控钉 0 下检测器的非零
+                    # 报值都是瞬态假阳性（实测首烧 split 报 695 真值 0），所以
+                    # 稳定 5 帧仍静默/自相矛盾 = 相位确为 0，直接采信锚点，
+                    # 不再干等 20s 窗口（首版漏把静默判定用于 conf2 分支，假
+                    # 阳性流把窗口耗光落入 11s 重锁，慢但结果仍对）
+                    k2, conf2, m2 = 0, False, 'none'
+                    sk = _split_fix(raw, w, h)
+                    if sk is not None:
+                        k2, conf2, m2 = sk, True, 'split'
+                    elif cap.ref is not None:
+                        rk, rc = _measure_roll(raw, cap.ref, w, h)
+                        if rc:
+                            k2, conf2, m2 = rk, True, 'ref'
+                    if conf2 and last_km is not None and \
+                            min((k2 - last_km[0]) % h,
+                                (last_km[0] - k2) % h) <= 3:
+                        k, conf, m = k2, True, m2
+                        break
+                    last_km = (k2, m2) if conf2 else None
+                    print(f"[align] dbg: cs sk={sk} k2={k2} conf2={conf2} "
+                          f"stable={stable}", flush=True)
+                    if stable >= 5:
+                        k, conf, m = 0, True, 'gated'
+                        break
                     continue
                 k2, conf2, m2 = _measure_phase(raw, recent, cap.ref, w, h,
                                                bootstrap)

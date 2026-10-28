@@ -1,0 +1,88 @@
+From 68f3f923bf0dc25396da8645f1a3180bdb4d6356 Mon Sep 17 00:00:00 2001
+From: huangzhao <huangzhao@WIN-TLG0U98OLAE>
+Date: Wed, 28 Oct 2026 20:24:18 +0800
+Subject: [PATCH 1/2] =?UTF-8?q?tc35874x:=20HPD=E9=97=A8=E6=8E=A7=20?=
+ =?UTF-8?q?=E2=80=94=20probe=E5=88=B0=E9=A6=96=E6=AC=A1=E5=BC=80=E6=B5=81?=
+ =?UTF-8?q?=E5=89=8D=E4=BF=9D=E6=8C=81HPD=E6=8B=89=E4=BD=8E=E4=B8=8D?=
+ =?UTF-8?q?=E6=94=BE=E8=A1=8C=E6=BA=90=E7=AB=AF?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+冷启动时源已在输出的场景，芯片/链路在随机相位建帧（卷动根源），
+只能靠用户态测量+干净重锁纠正（~20s）。门控后源端视为显示器未
+就绪而停输出，应用层首次s_stream(1)时才拉高HPD放行，源从帧边界
+重启输出，配合延迟解静音相位恒0，冷启动对齐缩到开流后几秒。
+源不理会HPD的场景信号一直在，用户态走原测量路径不受影响。
+---
+ drivers/media/i2c/tc35874x.c | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/drivers/media/i2c/tc35874x.c b/drivers/media/i2c/tc35874x.c
+index 51a7da6c6..d812fbaad 100644
+--- a/drivers/media/i2c/tc35874x.c
++++ b/drivers/media/i2c/tc35874x.c
+@@ -215,6 +215,10 @@ struct tc35874x_state {
+ 	struct work_struct work_i2c_poll;
+ 	unsigned int poll_ticks;	/* 漏边恢复节流计数（见 work_i2c_poll） */
+ 
++	/* CCS HPD 门控：probe 后到首次开流前保持 HPD 拉低，不放行源端
++	 * （见 tc35874x_enable_edid 注释） */
++	bool hpd_gated;
++
+ 	/* edid  */
+ 	u8 edid_blocks_written;
+ 
+@@ -596,6 +600,20 @@ static void tc35874x_enable_edid(struct v4l2_subdev *sd)
+ 
+ 	v4l2_dbg(2, debug, sd, "%s:\n", __func__);
+ 
++	/* CCS HPD 门控：冷启动时若源已在输出，芯片/链路会在随机相位建帧
++	 * （画面垂直卷动的根源），只能靠事后测量+重锁纠正（~20s）。门控
++	 * 期间不放行源端：HPD 保持拉低，源端视为显示器未就绪而停输出；
++	 * 等应用层首次开流（s_stream(1)，采集端已就绪）时才拉高 HPD 放行，
++	 * 源从帧边界重启输出，配合延迟解静音把相位钉 0——冷启动对齐
++	 * 从 ~20s 缩到开流后几秒。EDID 照常已写入、中断照常开，只是不
++	 * 调度 hotplug（不拉高 HPD）。源不理会 HPD 的场景：信号一直在，
++	 * 用户态走原有测量路径，不受门控影响。 */
++	if (state->hpd_gated) {
++		tc35874x_enable_interrupts(sd, true);
++		tc35874x_s_ctrl_detect_tx_5v(sd);
++		return;
++	}
++
+ 	/* Enable hotplug after 100 ms. DDC access to EDID is also enabled when
+ 	 * hotplug is enabled. See register DDC_CTL */
+ 	schedule_delayed_work(&state->delayed_work_enable_hotplug, HZ / 10);
+@@ -1847,6 +1865,17 @@ static int tc35874x_s_stream(struct v4l2_subdev *sd, int enable)
+ {
+ 	struct tc35874x_state *state = to_state(sd);
+ 
++	/* CCS HPD 门控放行：首次开流 = 采集端已就绪，此刻才拉高 HPD 让
++	 * 源从帧边界重启输出（见 enable_edid 门控注释）。放在 fast path
++	 * 之前：源不理会 HPD 时信号一直在，门控也必须在此清除。 */
++	if (enable && state->hpd_gated) {
++		state->hpd_gated = false;
++		if (state->edid_blocks_written)
++			schedule_delayed_work(&state->delayed_work_enable_hotplug,
++					      HZ / 10);
++		v4l2_info(sd, "ccs: hpd gate released on first stream on\n");
++	}
++
+ 	/* CCS 实验：信号已锁且 TX 已在输出时不重启 TX。
+ 	 * VI_MUTE 解静音瞬间 CSI TX 会在输入帧随机位置重建帧结构，
+ 	 * 表现为画面垂直卷动且相位每次开流随机。保持 TX 常开，
+@@ -2578,6 +2607,10 @@ static int tc35874x_probe(struct i2c_client *client,
+ 
+ 	tc35874x_set_csi_color_space(sd);
+ 
++	/* CCS HPD 门控：从 probe 起按住源端，直到应用层首次开流才放行
++	 * （s_edid→enable_edid 会被门控拦截，HPD 保持拉低） */
++	state->hpd_gated = true;
++
+ 	def_edid.pad = 0;
+ 	def_edid.start_block = 0;
+ 	def_edid.blocks = 1;
+-- 
+2.43.0
+

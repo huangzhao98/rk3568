@@ -1,0 +1,81 @@
+From b5b869cd13797f87167d39059ec54de9da69fc41 Mon Sep 17 00:00:00 2001
+From: huangzhao <huangzhao@WIN-TLG0U98OLAE>
+Date: Wed, 28 Oct 2026 20:35:26 +0800
+Subject: [PATCH 2/2] =?UTF-8?q?tc35874x:=20HPD=E9=97=A8=E6=8E=A7=E6=94=BE?=
+ =?UTF-8?q?=E8=A1=8C=E7=82=B9=E6=8F=90=E5=89=8D=E5=88=B0set=5Ffmt=20?=
+ =?UTF-8?q?=E2=80=94=20=E4=BF=AE=E5=A4=8D=E6=97=A0=E4=BF=A1=E5=8F=B7?=
+ =?UTF-8?q?=E5=BC=80=E6=9C=BA=E5=8D=8F=E5=95=86=E6=AD=BB=E9=94=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+门控期间无信号可检测，时序停在默认640x480，只在s_stream放行会导致
+rkcif/v4l2src配720p协商失败、流永远开不起来（板上实测gst报Internal
+data stream error）。应用层开始配置采集（media-ctl set_fmt）即放行，
+源出图后漏边轮询/中断采进真实时序；相位仍由开流时延迟解静音钉0。
+---
+ drivers/media/i2c/tc35874x.c | 34 +++++++++++++++++++++++++---------
+ 1 file changed, 25 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/media/i2c/tc35874x.c b/drivers/media/i2c/tc35874x.c
+index d812fbaad..794371349 100644
+--- a/drivers/media/i2c/tc35874x.c
++++ b/drivers/media/i2c/tc35874x.c
+@@ -848,6 +848,26 @@ static inline void enable_stream(struct v4l2_subdev *sd, bool enable)
+ 	mutex_unlock(&state->confctl_mutex);
+ }
+ 
++/* CCS HPD 门控放行：应用层开始配置采集（set_fmt/s_stream(1)）即视为
++ * 采集端就绪，拉高 HPD 让源从帧边界重启输出（见 enable_edid 门控注释）。
++ * 不能只在 s_stream 放行：门控期间无信号可检测，state->timings 停在
++ * 默认 640x480，rkcif/v4l2src 配 720p 会因 subdev 时序不符协商失败，
++ * 流永远开不起来形成死锁（2026-10-28 实测 gst Internal data stream
++ * error）。set_fmt 放行后源 ~1-3s 出图，漏边轮询/中断把真实时序采进来，
++ * 协商即恢复；相位仍由开流时的延迟解静音钉 0，提前放行无害。 */
++static void tc35874x_hpd_gate_release(struct v4l2_subdev *sd)
++{
++	struct tc35874x_state *state = to_state(sd);
++
++	if (!state->hpd_gated)
++		return;
++	state->hpd_gated = false;
++	if (state->edid_blocks_written)
++		schedule_delayed_work(&state->delayed_work_enable_hotplug,
++				      HZ / 10);
++	v4l2_info(sd, "ccs: hpd gate released\n");
++}
++
+ static void tc35874x_set_pll(struct v4l2_subdev *sd)
+ {
+ 	struct tc35874x_state *state = to_state(sd);
+@@ -1866,15 +1886,9 @@ static int tc35874x_s_stream(struct v4l2_subdev *sd, int enable)
+ 	struct tc35874x_state *state = to_state(sd);
+ 
+ 	/* CCS HPD 门控放行：首次开流 = 采集端已就绪，此刻才拉高 HPD 让
+-	 * 源从帧边界重启输出（见 enable_edid 门控注释）。放在 fast path
+-	 * 之前：源不理会 HPD 时信号一直在，门控也必须在此清除。 */
+-	if (enable && state->hpd_gated) {
+-		state->hpd_gated = false;
+-		if (state->edid_blocks_written)
+-			schedule_delayed_work(&state->delayed_work_enable_hotplug,
+-					      HZ / 10);
+-		v4l2_info(sd, "ccs: hpd gate released on first stream on\n");
+-	}
++	 * 源从帧边界重启输出（见 enable_edid 门控注释）。 */
++	if (enable)
++		tc35874x_hpd_gate_release(sd);
+ 
+ 	/* CCS 实验：信号已锁且 TX 已在输出时不重启 TX。
+ 	 * VI_MUTE 解静音瞬间 CSI TX 会在输入帧随机位置重建帧结构，
+@@ -2047,6 +2061,8 @@ static int tc35874x_set_fmt(struct v4l2_subdev *sd,
+ 	if (format->which == V4L2_SUBDEV_FORMAT_TRY)
+ 		return 0;
+ 
++	tc35874x_hpd_gate_release(sd);
++
+ 	state->mbus_fmt_code = format->format.code;
+ 
+ 	mode = tc35874x_find_best_fit(format);
+-- 
+2.43.0
+
