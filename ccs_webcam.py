@@ -1662,12 +1662,13 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
             # 测出相同相位（±3 行）**才接受——开机/重锁瞬态内容在变化
             # （Windows 扩展屏初始化很慢），单次测量会自信地错
             # （2026-10-27 量产首烧实测：split 在瞬态帧测出 672，真值
-            # 713，用户只能手动 nudge）。重锁前窗口 15s（双帧确认只需 ~2
-            # 个测量帧，检测器几秒内不命中就是画面没特征，等再久也测不出，
-            # 趁早重锁）；重锁后窗口 20s 且稳定后 10s 即提前采信锚点
-            # （重锁后画面方正检测器必然静默，等满窗口是纯浪费——2026-10-27
-            # 用户反馈对齐太慢）。一直 0 帧说明芯片还是被静音了（清锁存与
-            # 驱动轮询赛跑输了），重试
+            # 713，用户只能手动 nudge）。重锁前窗口 6s（双帧确认只需 ~2
+            # 个测量帧，检测器几秒内不命中就是画面没特征/钉值已失效，
+            # 等再久也测不出，趁早重锁——2026-10-28 实测冷启动钉值失效
+            # 时白等 15s 才重锁，全程 39s，用户嫌慢）；重锁后窗口 20s
+            # 且稳定 5 帧即提前采信锚点（重锁后画面方正检测器必然静默，
+            # 等满窗口是纯浪费）。一直 0 帧说明芯片还是被静音了（清锁存
+            # 与驱动轮询赛跑输了），重试
             raw, stable, none_streak, t0 = None, 0, 0, time.time()
             recent = []                  # 最近 3 帧：接缝检测的时间稳定性验证用
             last_km = None               # 上一帧测量 (k, via)
@@ -1690,7 +1691,7 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                         except OSError:
                             pass
                 continue
-            win = 20 if relocked else 15
+            win = 20 if relocked else 6
             # 有参考帧（热拔插恢复等）时内容稳定门限 10→3 帧：ref 全帧相关
             # 本身即强校验，热拔插路径对齐 3s→~1s，对标树莓派恢复速度
             # （2026-10-28 实测）；bootstrap 无校验手段，维持 10 帧保守
@@ -1718,7 +1719,10 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                                                bootstrap)
                 if not conf2:
                     last_km = None
-                    if relocked and time.time() - t0 > 10:
+                    # 重锁后相位锚 0，画面方正时检测器静默是预期：稳定 5 帧
+                    # 内容没变还没测出东西 = 没有特征可测，立即采信锚点
+                    # （原来干等 10s）；重锁本身已含 8s 稳定确认，无需再等
+                    if relocked and (time.time() - t0 > 10 or stable >= 5):
                         break        # 重锁后画面已稳定且静默（预期），采信锚点
                     continue
                 if last_km is not None and min((k2 - last_km[0]) % h,
