@@ -1,0 +1,54 @@
+#!/bin/sh
+# /etc/init.d/S99ccs — RK3568-CCS 底板外设初始化 + 应用自启动
+# 【已存档】一期主系统已改为 Ubuntu 22.04（systemd），
+# 请改用同目录 ccs.service + ccs_init.sh；本文件仅供 buildroot 路线备查。
+
+case "$1" in
+start)
+    echo "[ccs] init start"
+
+    # 1. USB HID gadget（模拟键鼠，USB3_OTG0 device 模式）
+    sh /usr/sbin/40_hid_gadget.sh start
+
+    # 2. MS9288C 初始化（VGA→HDMI，挂 i2c3）
+    #    [TODO] 寄存器序列按厂家配置表填；若上电默认直通可整段删
+    # BUS=3; ADDR=0x2b    # 地址以 i2cdetect -y 3 实测为准
+    # i2cset -y $BUS $ADDR 0x00 0x01
+    # ...
+
+    # 3. 视频采集通道选择（TMUX121 SEL = GPIO1_B1，线名 "5G_RESET"）
+    #    0=HDMI 路（默认，R80 15k 下拉），1=VGA 路
+    #    注意：SW2 拨码闭合时硬件强制 VGA 路，此处设置无效（也不应反向驱动）
+    # gpioset $(gpiofind "5G_RESET")=0
+
+    # 4. 工作灯/状态灯已由 dts gpio-leds（ccs:working=GPIO0_C0 heartbeat）接管；
+    #    四色 LED 用线名直控：
+    #    gpioset $(gpiofind "LED_RED_STATE")=1    # GPIO2_C6 → LED14 红
+    #    gpioset $(gpiofind "LED_GREEN_STATE")=1  # GPIO2_B1 → LED16 绿
+    #    gpioset $(gpiofind "LED_YELLOW_STATE")=1 # GPIO2_B2 → LED15 黄
+    #    gpioset $(gpiofind "LED_BLUE_STATE")=1   # GPIO2_C5 → LED17 蓝
+
+    # 5. PICO（RP2040）说明：
+    #    SW10 拨码闭合后 PICO 的 USB 切到板内 USB2_HOST3，
+    #    枚举为 /dev/ttyACM0（cdc_acm 需进内核配置）；
+    #    SW10 断开时 PICO 连 USB4 Type-C（外部供电/通讯/刷机）。
+    #    SW11=BOOTSEL：闭合后上电/复位进 USB bootloader，
+    #    配合 SW10 闭合可用 picotool 从 RK3568 在线刷 PICO 固件。
+    #    无需脚本动作，仅注释备查。
+
+    # 6. 视频采集守护（采集→rkmpp 编码→推流），二期
+    # /usr/bin/ccs_capture &
+
+    # 7. 键鼠转发守护（网络→/dev/hidg0/1 或→/dev/ttyACM0 给 RP2040），二期
+    # /usr/bin/ccs_hid_daemon &
+
+    echo "[ccs] init done"
+    ;;
+stop)
+    sh /usr/sbin/40_hid_gadget.sh stop
+    ;;
+*)
+    echo "usage: $0 start|stop"
+    ;;
+esac
+exit 0

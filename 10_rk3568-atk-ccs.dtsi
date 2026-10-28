@@ -1,0 +1,467 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * RK3568-CCS-V1.0 底板设备树增量（0916A 原理图复核版）
+ *
+ * 用法：放到 kernel/arch/arm64/boot/dts/rockchip/ 下，
+ * 在 rk3568-atk-evb1-ddr4-v10-linux.dts 末尾 #include 本文件；
+ * 或新建 rk3568-atk-ccs-v10.dts 包含原厂 dts 再 include 本文件，
+ * 并改 BoardConfig 的 RK_KERNEL_DTS。
+ *
+ * IO 分配依据：buildroot_dev/02_IO与复用配置总表.md（0916A 全 22 页复核 +
+ * 金手指复用表 V1.1 交叉核对）。
+ *
+ * ★ 视频采集为 HDMI/VGA 二选一：两颗 TC358743 的 CSI 4-lane 和 I2C4
+ *   经 6 颗 TMUX121（U14/U16~U20，SEL=GPIO1_B1，R80 15k 下拉默认 0=HDMI）
+ *   切换，共用 MIPI_CSI_RX 与 i2c4；第 7 颗 TMUX121(U32) 在 P6.3 用于
+ *   PICO USB 通路选择，与视频无关。
+ *   SW2 拨码（P3.3，经 R87 2k 上拉 SEL）闭合可硬件强制 VGA 路。
+ *   设备树只实例化一颗 tc358743，切通道流程（用户态）：
+ *     1) echo 解绑/停流；2) gpioset SEL=目标通道；
+ *     3) 复位目标芯片（见下 reset 分工）；4) 重新 bind 或 v4l2-ctl 重探测。
+ *
+ * ★ RGMII 电平：两路 PHY 的 VCCIO 均为 1.8V（VCC_1V8 经磁珠），
+ *   核心板 GPIO2/GPIO4 域须为 1.8V（P6.2 页 U29 VCCA=VCC_1V8 佐证
+ *   GPIO2 域=1.8V）。pmu-io-domains 沿用核心板出厂配置即可，
+ *   烧写前用万用表点核（见配置总表第四节）。
+ *
+ * ★ 与 ccs_dev/10_rk3568-atk-ccs.dtsi 原稿的差异（适配 4.19 SDK 实际
+ *   标签/避免与原厂 evb1 dtsi 冲突）：
+ *   1) gmac0 的 pinctrl 组在 4.19 pinctrl 里叫 gmac0_*（无 m1 后缀，
+ *      gmac0 引脚只有一组），gmac0m1_clkinout 实际为 gmac0_clkinout；
+ *   2) mdio0/mdio1 标签已存在于 rk3568.dtsi 的 gmac0/gmac1 节点内，
+ *      不能重复定义，改为 &mdio0/&mdio1 引用追加；
+ *      PHY 标签改为 ccs_phy0/ccs_phy1（原厂已占用 rgmii_phy0/1@addr0，
+ *      原样使用会重复定义标签）；
+ *   3) 原厂 dtsi 的 csi2_dphy0 port@0 已占用 endpoint@1~3
+ *      （mipi_in_ucam0/1/2，接 imx335/imx415/ov13850），
+ *      我们的 tc358743 输入改用 endpoint@4，避免节点合并冲突；
+ *   4) 补齐 rkcif 数据通路：csi2_dphy0 port@1 增加 dphy_rkcif_out
+ *      端点指向 rkcif_mipi_lvds 的 cif_mipi_in（参照 rk3568-evb2 的
+ *      4.19 rkcif 接法），并使能 rkcif_mmu。
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+
+/ {
+	/* TC358743 主钟：X3/X5 27MHz 有源晶振 */
+	clk_27m_tc358743: clk-27m-tc358743 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <27000000>;
+	};
+};
+
+/* ---------------- GPIO line names（按 0916A 金手指页逐脚核对） ---------------- */
+&gpio0 {
+	gpio-line-names =
+		/* A0~A7 */ "REFCLK_OUT", "", "", "", "SDMMC0_DET_L", "USB_OTG_PWREN_H", "USB_HOST_PWREN_H", "",
+		/* B0~B7 */ "", "", "", "I2C1_SCL_TP", "I2C1_SDA_TP", "TP_INT_L", "TP_RST_L", "BT_WAKE_HOST_H",
+		/* C0~C7 */ "WORKING_LEDEN_H", "PWM_FAN", "EDP_HPDIN_M1", "LCD0_BL_PWM4", "LCD1_BL_PWM5", "LVDS_TP_INT_L", "PWM7_IR", "LCD0_PWREN_H",
+		/* D0~D7 */ "UART2_RX_M0", "UART2_TX_M0", "", "RTCIC_INT_L", "PCIE_PWREN_H", "VGA_PWREN_H", "5G_PWR_ON_OFF", "";
+};
+
+&gpio1 {
+	gpio-line-names =
+		/* A0~A7 */ "I2C3_SDA_M0", "I2C3_SCL_M0", "", "", "HP_DET_L", "", "", "",
+		/* B0~B7 */ "GSENSOR_INT", "5G_RESET", "LCD0_RST_L", "", "", "", "", "",
+		/* C0~C7 */ "", "", "", "", "", "", "", "",
+		/* D0~D7 */ "", "", "", "", "", "", "", "";
+};
+
+&gpio2 {
+	gpio-line-names =
+		/* A0~A7 */ "SDMMC0_D3", "SDMMC0_CMD", "SDMMC0_CLK", "GMAC0_RXD2", "GMAC0_RXD3", "GMAC0_RXCLK", "GMAC0_TXD2", "GMAC0_TXD3",
+		/* B0~B7 */ "GMAC0_TXCLK", "LED_GREEN_STATE", "LED_YELLOW_STATE", "GMAC0_TXD0", "GMAC0_TXD1", "GMAC0_TXEN", "GMAC0_RXD0", "GMAC0_RXD1",
+		/* C0~C7 */ "GMAC0_RXDV_CRS", "ETH0_REFCLKO_25M", "GMAC0_MCLKINOUT", "GMAC0_MDC", "GMAC0_MDIO", "LED_BLUE_STATE", "LED_RED_STATE", "",
+		/* D0~D7 */ "GMAC1_INT", "GMAC1_RSTn", "GMAC0_INT", "GMAC0_RSTn", "PCIE30X2_CLKREQn", "PCIE30X2_WAKEn", "PCIE30X2_PERSTn", "PCIE30X2_PRSNT";
+};
+
+&gpio3 {
+	gpio-line-names =
+		/* A0~A7 */ "BT_REG_ON_H", "SPI1_CS0_M1", "HOST_WAKE_BT_H", "I2S3_SCLK_M0", "I2S3_LRCK_M0", "I2S3_SDO_M0", "I2S3_SDI_M0", "PCIECLKIC_OE_H",
+		/* B0~B7 */ "5G_DISABLE", "UART4_RX_M1", "UART4_TX_M1", "I2C5_SCL_M0", "I2C5_SDA_M0", "VGA_TC358743_RST_L", "HD_TC358743_RST_L", "UART3_TX_M1",
+		/* C0~C7 */ "UART3_RX_M1", "SPI1_MOSI_M1", "SPI1_MISO_M1", "SPI1_CLK_M1", "LVDS_TP_RST_L", "", "SDMMC2_D0", "SDMMC2_D1",
+		/* D0~D7 */ "SDMMC2_D2", "SDMMC2_D3", "SDMMC2_CMD", "SDMMC2_CLK", "WIFI_WAKE_HOST_H", "WIFI_REG_ON_H", "GMAC1_TXD2", "GMAC1_TXD3";
+};
+
+&gpio4 {
+	gpio-line-names =
+		/* A0~A7 */ "GMAC1_TXCLK", "GMAC1_RXD2", "GMAC1_RXD3", "GMAC1_RXCLK", "GMAC1_TXD0", "GMAC1_TXD1", "GMAC1_TXEN", "GMAC1_RXD0",
+		/* B0~B7 */ "GMAC1_RXD1", "GMAC1_RXDV_CRS", "I2C4_SDA_M0", "I2C4_SCL_M0", "HD_TC358743_INT", "MIPI_DSI_RESET", "GMAC1_MDC", "GMAC1_MDIO",
+		/* C0~C7 */ "CIF_CLKOUT", "GMAC1_MCLKINOUT", "CAN1_RX_M1", "CAN1_TX_M1", "SATA2_ACT_LED", "UART9_TX_M1", "PWR_SW_DETECT", "HDMITX_SCL",
+		/* D0~D7 */ "HDMITX_SDA", "HDMITX_CEC_M0", "AP_INT", "", "", "", "", "";
+};
+
+/* 原厂 rm500u_5g 节点（rfkill_wwan 驱动）会把 GPIO1_B1（5G_RESET）钉死为 out-lo。
+ * CCS 板上该网络同时是 TMUX121 的通道选择 SEL（R80 15k 下拉默认 0=HDMI 路，
+ * SW2 拨码硬件强制 1=VGA 路）——驱动强驱低会让 SW2 强制失效并造成驱动冲突。
+ * CCS 底板无 5G 模块，禁用该节点，SEL 保持高阻由 R80/SW2 决定。 */
+&rm500u_5g {
+	status = "disabled";
+};
+
+/* ---------------- I2C ---------------- */
+
+/* i2c1 (GPIO0_B3/B4)：OLED（JP6 座，P6.2，R204/R205 4.7k 上拉）+ TP 预留
+ * 注意：原厂 evb1 dtsi 在 i2c1 下挂有 gt911 触摸屏（dsi_touch），
+ * CCS 底板无此器件，probe 失败无害，保持不动 */
+&i2c1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c1_xfer>;
+	/* OLED 驱动走用户态（luma.oled/ssd1306 库）或 fbtft，按二期需求加 */
+};
+
+/* i2c3 (GPIO1_A0/A1)：MS9288C + MS9332/MS8005F */
+&i2c3 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c3m0_xfer>;
+
+	ms9288c: ms9288c@2b {
+		compatible = "macrosilicon,ms9288c";
+		reg = <0x2b>;	/* [TODO] 以厂家资料实测 i2cdetect 为准 */
+		/*
+		 * 无内核驱动计划：节点仅占位文档化。
+		 * 上电后用 i2cdetect -y 3 确认地址；
+		 * 若默认上电已直通 VGA→HDMI，则只需确认时序；
+		 * 否则初始化 i2cset 序列写进 S99ccs。
+		 */
+		status = "okay";
+	};
+	/* MS9332/MS8005F（HDMI 环出分配链）自管理，无需节点；
+	 * 如需在 Linux 下读状态可后加节点 */
+};
+
+/* i2c4 (GPIO4_B2/B3)：TC358743 ×2，TMUX121(U20) 二选一
+ * 正式板首版 I2C4 外部上拉电阻未贴（原理图位号预留但未上件），
+ * 这里改用 SoC 内上拉兜底；内上拉较弱（约 20kΩ 量级，经 U20 还有
+ * 额外电容），clock-frequency 降到 50kHz 保证上升沿时间。
+ * 后续批次若贴回外部 2.2k~4.7k 上拉，内上拉并联无害，可把
+ * pinctrl-0 换回 <&i2c4m0_xfer>、clock-frequency 换回 400k。 */
+&pinctrl {
+	i2c4 {
+		ccs_i2c4m0_xfer: ccs-i2c4m0-xfer {
+			rockchip,pins =
+				<4 RK_PB3 1 &pcfg_pull_up_smt>,	/* i2c4_sclm0 */
+				<4 RK_PB2 1 &pcfg_pull_up_smt>;	/* i2c4_sdam0 */
+		};
+	};
+};
+
+&i2c4 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&ccs_i2c4m0_xfer>;
+	clock-frequency = <50000>;
+
+	/*
+	 * 设备树只描述"当前选中的那一颗"。默认 SEL=0 为 HDMI 路(U15)。
+	 * reset 分工：HDMI 路=GPIO3_B6，VGA 路=GPIO3_B5；
+	 *            （均有 15k 串联 + 节点 18k 下拉，上电保持复位，驱动释放后工作）
+	 * INT  分工：HDMI 路=GPIO4_B4，VGA 路=GPIO0_B5。
+	 * 切到 VGA 路时用 libgpiod 拉 GPIO3_B5 复位后重新探测，
+	 * 并把 interrupts 改成 GPIO0_B5（或干脆用户态轮询 DV timings，
+	 * 两路 INT 都接中断会让驱动在切换后收到错误来源的中断）。
+	 */
+	tc358743: tc358743@0f {
+		compatible = "toshiba,tc358743";
+		reg = <0x0f>;
+		clocks = <&clk_27m_tc358743>;
+		clock-names = "refclk";
+		/* RK tc35874x 驱动 probe 强制要求以下四个 module 属性，缺一返回 -EINVAL */
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "CCS-HDMI";
+		rockchip,camera-module-lens-name = "TC35874X";
+		reset-gpios = <&gpio3 RK_PB6 GPIO_ACTIVE_LOW>;	/* MIPICAM0_RST_L（HDMI 路） */
+		/* 不给 interrupts：驱动回退到 1s i2c 轮询检测 5V/时序变化。
+		 * EVB 转接模块 INT 脚未接线，走中断模式会导致插线后 HPD 永不拉起；
+		 * CCS 实物 INT=GPIO4_B4 已接，如需中断模式可加回：
+		 * interrupt-parent = <&gpio4>; interrupts = <RK_PB4 IRQ_TYPE_LEVEL_HIGH>; */
+		port {
+			tc358743_out: endpoint {
+				remote-endpoint = <&mipi_csi2_input>;
+				/* CCS 正式板（0916A）为 4-lane：D0~D3 经 TMUX121 全部引出。
+				 * 4-lane@594Mbps 带宽上限 = 1080p60（UYVY，891Mbps/lane 需求）。
+				 * 旧 EVB 转接模块仅 2-lane（lane3/4 未引出），上限 1080p30/720p60。 */
+				data-lanes = <1 2 3 4>;
+				clock-lanes = <0>;
+				/* 不写 clock-noncontinuous：tc35874x 默认连续时钟输出，
+				 * RK 参考设计（evb2 lt6911uxc）同样连续时钟；
+				 * 写非连续会导致 dphy 同步不上、收不到帧 */
+				/* 4.19 tc358743 驱动强制要求 link-frequencies，否则 probe 报 -22；
+				 * 297MHz = 594Mbps/lane，实际速率由驱动按 HDMI 时序自配 PLL */
+				link-frequencies = /bits/ 64 <297000000>;
+			};
+		};
+	};
+};
+
+/* i2c5 (GPIO3_B3/B4)：PCF8563 RTC
+ * 原厂 evb1 dtsi 已在 i2c5 下挂了 rtc@51（同地址同中断），此处与之合并，
+ * 仅补充标签并显式确认中断配置 */
+&i2c5 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c5m0_xfer>;
+
+	pcf8563: rtc@51 {
+		compatible = "nxp,pcf8563";
+		reg = <0x51>;
+		interrupt-parent = <&gpio0>;
+		interrupts = <RK_PD3 IRQ_TYPE_LEVEL_LOW>;	/* RTCIC_INT_L = GPIO0_D3（金手指 250 脚） */
+	};
+};
+
+/* ---------------- MIPI CSI（单路 4-lane，二选一输入） ---------------- */
+
+&csi2_dphy_hw {
+	status = "okay";
+};
+
+/* dphy0 保持单摄模式（默认 full，不要开 2x2 拆分）
+ * 原厂 port@0 的 endpoint@1~3 已被 imx335/imx415/ov13850 占用
+ * （CCS 底板无这些 Sensor，节点保留无害），tc358743 用 endpoint@4 */
+&csi2_dphy0 {
+	status = "okay";
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			dphy0_in_tc358743: endpoint@4 {
+				reg = <4>;
+				remote-endpoint = <&tc358743_out>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+		/* port@1：dphy 输出。原厂 endpoint@0(csidphy_out)→ISP 保留不动；
+		 * 增加 endpoint@1 接到 mipi_csi2 host（参照 rk3568-evb2 接法：
+		 * sensor → dphy → mipi_csi2 host → rkcif，host 不可跳过） */
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			dphy_rkcif_out: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&mipi_csi2_input>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+	};
+};
+
+/* CSI host 控制器（协议解码层）：底包默认 disabled，必须打开，
+ * 否则 dphy 到 rkcif 之间没有通路，rkcif 零中断零帧 */
+&mipi_csi2 {
+	status = "okay";
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			mipi_csi2_input: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dphy_rkcif_out>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			mipi_csi2_output: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&cif_mipi_in>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+	};
+};
+
+&rkcif {
+	status = "okay";
+};
+
+&rkcif_mmu {
+	status = "okay";
+};
+
+&rkcif_mipi_lvds {
+	status = "okay";
+	/* 参照 rk3568-evb2 的 4.19 rkcif 接法补齐 port/endpoint */
+	port {
+		cif_mipi_in: endpoint {
+			remote-endpoint = <&mipi_csi2_output>;
+			data-lanes = <1 2 3 4>;
+		};
+	};
+};
+
+/* ---------------- 以太网 ---------------- */
+
+/* PHY1：YT8531C U24 @ GMAC0（RGMII，GPIO2 组），地址 0x01，
+ * PHY 内部 RXDLY/TXDLY strap 下拉=关闭 → 延时由 MAC 侧 taps 给；
+ * VCCIO_PHY0=1.8V（VCC_1V8 经 L23）
+ * 注意：gmac0 引脚组在 4.19 pinctrl 里无 m1 后缀（gmac0_*） */
+&gmac0 {
+	phy-mode = "rgmii";
+	clock_in_out = "input";		/* 125M 由 YT8531C CLKOUT 回送 */
+	assigned-clocks = <&cru SCLK_GMAC0_RX_TX>, <&cru SCLK_GMAC0>;
+	assigned-clock-parents = <&cru SCLK_GMAC0_RGMII_SPEED>, <&cru CLK_MAC0_2TOP>;
+	assigned-clock-rates = <0>, <125000000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&gmac0_miim
+		     &gmac0_tx_bus2
+		     &gmac0_rx_bus2
+		     &gmac0_rgmii_clk
+		     &gmac0_rgmii_bus
+		     &gmac0_clkinout>;
+	tx_delay = <0x30>;		/* [TODO] iperf3 实测后微调 */
+	rx_delay = <0x28>;		/* [TODO] 同上 */
+	phy-handle = <&ccs_phy0>;
+	snps,reset-gpio = <&gpio2 RK_PD3 GPIO_ACTIVE_LOW>;	/* GMAC0_RSTn */
+	snps,reset-active-low;
+	snps,reset-delays-us = <0 20000 100000>;
+	status = "okay";
+};
+
+/* mdio0/mdio1 标签已在 rk3568.dtsi 的 gmac 节点内定义，此处引用追加。
+ * CCS 的 YT8531C 地址为 0x01（原厂的 rgmii_phy0/1@0 保留，无硬件不探测） */
+&mdio0 {
+	ccs_phy0: phy@1 {
+		compatible = "ethernet-phy-ieee802.3-c22";
+		reg = <0x1>;
+	};
+};
+
+/* PHY2：YT8531C U25 @ GMAC1_M1（GPIO4 组 + GPIO3_D6/D7），地址 0x01
+ * （独立 MDIO 总线，与 PHY1 同址不冲突）；VCCIO_PHY1=1.8V（经 L27） */
+&gmac1 {
+	phy-mode = "rgmii";
+	clock_in_out = "input";
+	assigned-clocks = <&cru SCLK_GMAC1_RX_TX>, <&cru SCLK_GMAC1>;
+	assigned-clock-parents = <&cru SCLK_GMAC1_RGMII_SPEED>, <&cru CLK_MAC1_2TOP>;
+	assigned-clock-rates = <0>, <125000000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&gmac1m1_miim
+		     &gmac1m1_tx_bus2
+		     &gmac1m1_rx_bus2
+		     &gmac1m1_rgmii_clk
+		     &gmac1m1_rgmii_bus>;
+	tx_delay = <0x30>;		/* [TODO] 实测微调 */
+	rx_delay = <0x28>;
+	phy-handle = <&ccs_phy1>;
+	snps,reset-gpio = <&gpio2 RK_PD1 GPIO_ACTIVE_LOW>;	/* GMAC1_RSTn */
+	snps,reset-active-low;
+	snps,reset-delays-us = <0 20000 100000>;
+	status = "okay";
+};
+
+&mdio1 {
+	ccs_phy1: phy@1 {
+		compatible = "ethernet-phy-ieee802.3-c22";
+		reg = <0x1>;
+	};
+};
+
+/* ---------------- 串口 ---------------- */
+
+/* uart2：调试控制台（保持出厂默认，勿动） */
+
+/* uart3 (GPIO3_B7/C0, M1)：RS232（SP3232，JP5B 出）
+ * 与原厂 evb1 配置一致（原厂已 okay + uart3m1_xfer），重复确认无害 */
+&uart3 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart3m1_xfer>;
+};
+
+/* uart4 (GPIO3_B1/B2, M1)：RS485（SP3485，JP5A 出）
+ * 方向为 Q10 硬件自动方向电路，无需 rs485-rts-gpio，
+ * 应用层当普通串口用即可 */
+&uart4 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart4m1_xfer>;
+};
+
+/* uart8：禁止使能！四脚当 GPIO 经 U29(TXS0104) 驱动 LED 状态：
+ * GPIO2_C5(TX)→LED17 蓝，GPIO2_B1(RTSn)→LED16 绿，
+ * GPIO2_B2(CTSn)→LED15 黄，GPIO2_C6(RX)→LED14 红。
+ * 默认复位态即 gpio 功能，不引用 uart8m0 组即可 */
+
+/* uart9：禁止使能！GPIO4_C6 为电源开关检测输入（R27 5.9k+D12），
+ * GPIO4_C5(TX) 载板未接 */
+
+/* ---------------- USB ---------------- */
+
+/* USB3_OTG0 → Type-C USB3，跑 HID gadget。
+ * 完全对齐 SDK 内验证过的 gadget 配置（rk3566-box.dtsi / rk3568-evb.dtsi）：
+ * dr_mode="otg" + extcon=<&usb2phy0>，角色由 USB2 PHY 的 extcon 插拔事件
+ * 驱动（drd.c）：无线时控制器全 idle，插 PC 后 phy 检出 SDP/vbus →
+ * EXTCON_USB=1 → drd 切 device → udc 注册 → 由 udev 规则触发绑定。
+ * 教训 1：固定 dr_mode="peripheral" 无 extcon 时，绑定 gadget 后 dwc3 以
+ *         ~84ms 周期狂刷 device disconnect（解绑即停），PC 无法枚举。
+ * 教训 2：必须同时开 u2phy0_otg——dwc3 的 VBUS/session 检测和 HS 数据
+ *         通路都走 USB2 PHY 的 otg-port，原厂 dtsi 只开了 u2phy0_host。
+ * 只需 HS（HID），故 phys 只挂 u2phy0_otg 并限 high-speed，不占 combphy0。
+ * phy-supply 沿用原厂的 vcc5v0_usb（与 *_host 一致）。 */
+&usbdrd_dwc3 {
+	dr_mode = "otg";
+	phys = <&u2phy0_otg>;
+	maximum-speed = "high-speed";
+	extcon = <&usb2phy0>;
+	status = "okay";
+};
+&u2phy0_otg {
+	phy-supply = <&vcc5v0_usb>;
+	status = "okay";
+};
+/* VBUS 开关 U10(MT9700) EN=GPIO0_A5：device 模式下由 S99ccs
+ * 用 libgpiod 管理即可，不占 regulator。
+ * VBUSDET 经 R58 10k+R59 15k 分压进 SoC，保持默认。 */
+
+/* USB2_HOST2 → SL2.2s HUB：host 控制器保持 SDK 默认使能即可，
+ * HUB 免驱；下行 4 口 MT9700 的 EN 接 VCC5V1_USB 常开，无 GPIO 控制，
+ * USB_HOST_PWREN_H(GPIO0_A6) 原理图未使用 */
+
+/* USB2_HOST3 → U32(TMXU121, P6.3)：SW10 拨码二选一。
+ * SW10 断开=PICO 连 USB4 Type-C（外部刷机/通讯/供电），
+ * SW10 闭合=PICO 连本口，RP2040 枚举为 /dev/ttyACM（板内指令通道）。
+ * host3 控制器保持 SDK 默认使能即可；闭合 SW11(BOOTSEL) 后可用
+ * picotool 经本口在线刷 PICO 固件 */
+
+/* ---------------- 杂项 ---------------- */
+
+/* 工作指示灯：WORKING_LEDEN_H = GPIO0_C0（金手指 260 脚，Q9/MMBT3906 驱动） */
+/ {
+	leds {
+		compatible = "gpio-leds";
+		working {
+			label = "ccs:working";
+			gpios = <&gpio0 RK_PC0 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+			linux,default-trigger = "heartbeat";
+		};
+	};
+};
+
+/* 按键：SARADC_VIN0 电阻梯（RECOVERY 等）、SARADC_VIN1=HW_ID，
+ * 参照原厂 dts 的 adc-keys 节点核对键值即可（原厂已带） */
+
+/* PWM_FAN = GPIO0_C1 = PWM2_M0（金手指 256 脚），风扇为 12V(VCC12VP)、
+ * Q17(2SK3018) 低边开关。可直接加 pwm-fan 节点：
+ *   &pwm2 { status = "okay"; pinctrl-0 = <&pwm2m0_pins>; };
+ * 调试期也可先用 libgpiod 直控 */
+
+/* HDMI TX（本地显示输出）：CEC 在用（HDMITX_CEC_M0=GPIO4_D1，Q6 电平转换），
+ * 保持原厂 hdmi 节点默认 pinctrl（含 cec）即可，勿把 GPIO4_D1 挪作他用 */
+
+/* TF 卡 SDMMC0、调试串口 uart2 等保持出厂默认 */

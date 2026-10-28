@@ -1,0 +1,11 @@
+[Unit]
+Description=CCS OLED status display (SSD1306 @ i2c-1 0x3C)
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/sbin/ccs_oled.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

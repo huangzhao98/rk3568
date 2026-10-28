@@ -1,0 +1,20 @@
+# /etc/systemd/system/ccs.service — CCS 底板外设初始化（Ubuntu/systemd 版自启动）
+# 安装：
+#   sudo cp ccs_init.sh 40_hid_gadget.sh /usr/sbin/ && sudo chmod 755 /usr/sbin/ccs_init.sh /usr/sbin/40_hid_gadget.sh
+#   sudo cp ccs.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable ccs.service
+[Unit]
+Description=CCS board peripherals init (HID gadget, video mux, MS9288C)
+After=local-fs.target
+# HID gadget 需要 configfs 与 UDC 就绪；usbgadget 相关 udev 规则之后
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ccs_init.sh start
+ExecStop=/usr/sbin/ccs_init.sh stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

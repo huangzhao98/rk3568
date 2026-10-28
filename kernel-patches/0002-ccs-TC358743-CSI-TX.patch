@@ -1,0 +1,94 @@
+From ed20e8029c14465d9ae453cec5e421de213b345b Mon Sep 17 00:00:00 2001
+From: huangzhao <huangzhao@WIN-TLG0U98OLAE>
+Date: Mon, 26 Oct 2026 15:07:24 +0800
+Subject: [PATCH 2/5] =?UTF-8?q?ccs:=20TC358743=20=E7=9B=B8=E4=BD=8D?=
+ =?UTF-8?q?=E5=9B=BA=E5=AE=9A=20=E2=80=94=20=E4=BF=A1=E5=8F=B7=E7=A8=B3?=
+ =?UTF-8?q?=E5=AE=9A=E5=90=8E=E4=B8=8D=E9=87=8D=E5=90=AF=20CSI=20TX?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+VI_MUTE 解静音瞬间 TX 在输入帧随机位置重建帧结构 → 画面垂直卷动、
+相位每次开流随机。实测 AUTO_MUTE 硬件解静音在帧边界对齐，只要
+不强制 mute/unmute，相位恒为常数（6 次冷启动 + 3 次服务重启 +
+unbind/rebind 恢复，phase_offset 全为 0）。
+
+- s_stream(1): TX 已在输出时只翻转 TXOPTIONCNTRL 给接收端补
+  LP11->HS 时钟 lane 跳变（不补则 rkcif 无法同步），不解静音
+- s_stream(0): 不再静音/停 TX，保持常开
+- format_change 无信号分支: 不再 enable_stream(false)，信号
+  丢失/恢复交给 AUTO_MUTE 自动处理
+- set_fmt: 模式未变且 TX 在输出时跳过 mute+reprogram
+
+注意: HDMIRST(0x0100) 运行时打会卡死 HDMI RX（TMDS 永久失锁），
+只能靠 unbind/rebind 全量 re-init 恢复，禁止用作对齐手段。
+回滚: git checkout 本文件重编译，或 dd 还原 backups 里的 boot.img
+---
+ drivers/media/i2c/tc35874x.c | 35 ++++++++++++++++++++++++++++-------
+ 1 file changed, 28 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/media/i2c/tc35874x.c b/drivers/media/i2c/tc35874x.c
+index d9ce4721b..060a54c35 100644
+--- a/drivers/media/i2c/tc35874x.c
++++ b/drivers/media/i2c/tc35874x.c
+@@ -1041,8 +1041,9 @@ static void tc35874x_format_change(struct v4l2_subdev *sd)
+ 	};
+ 
+ 	if (tc35874x_get_detected_timings(sd, &timings)) {
+-		enable_stream(sd, false);
+-
++		/* CCS 实验：无信号时不再 mute/停 TX，交给 AUTO_MUTE 自动
++		 * 处理，避免 HDMIRST 等瞬时静默杀流并导致信号恢复后
++		 * 相位被重摇。时序不匹配分支仍走原 reprogram 路径。 */
+ 		v4l2_dbg(1, debug, sd, "%s: No signal\n",
+ 				__func__);
+ 	} else {
+@@ -1696,11 +1697,24 @@ static int tc35874x_g_mbus_config(struct v4l2_subdev *sd,
+ 
+ static int tc35874x_s_stream(struct v4l2_subdev *sd, int enable)
+ {
++	/* CCS 实验：信号已锁且 TX 已在输出时不重启 TX。
++	 * VI_MUTE 解静音瞬间 CSI TX 会在输入帧随机位置重建帧结构，
++	 * 表现为画面垂直卷动且相位每次开流随机。保持 TX 常开，
++	 * 信号丢失交给 AUTO_MUTE 自动处理，相位由开机一次性对齐固定。 */
++	if (enable && !no_sync(sd) && !no_signal(sd) &&
++	    !(i2c_rd8(sd, VI_MUTE) & MASK_VI_MUTE)) {
++		/* 不解静音（帧结构不重建、相位保持），只给 CSI 接收端
++		 * 补一个时钟 lane 的 LP11->HS 跳变让它重新同步 */
++		i2c_wr32(sd, TXOPTIONCNTRL, 0);
++		i2c_wr32(sd, TXOPTIONCNTRL, MASK_CONTCLKMODE);
++		v4l2_info(sd, "ccs: tx already running, resync clk lane only\n");
++		return 0;
++	}
++	if (!enable) {
++		v4l2_info(sd, "ccs: keep tx running on s_stream(0)\n");
++		return 0;
++	}
+ 	enable_stream(sd, enable);
+-
+-	/* stop stream to reset csi*/
+-	if (!enable)
+-		tc35874x_set_csi(sd);
+ 	return 0;
+ }
+ 
+@@ -1851,8 +1865,15 @@ static int tc35874x_set_fmt(struct v4l2_subdev *sd,
+ 
+ 	state->mbus_fmt_code = format->format.code;
+ 
+-	enable_stream(sd, false);
+ 	mode = tc35874x_find_best_fit(format);
++	/* CCS 实验：模式没变且 TX 在输出时，不再 mute/reprogram，
++	 * 避免相位被重摇 */
++	if (mode == state->cur_mode && !no_sync(sd) &&
++	    !(i2c_rd8(sd, VI_MUTE) & MASK_VI_MUTE)) {
++		v4l2_info(sd, "ccs: fmt unchanged, keep tx running\n");
++		return 0;
++	}
++	enable_stream(sd, false);
+ 	state->cur_mode = mode;
+ 
+ 	__v4l2_ctrl_s_ctrl(state->link_freq,
+-- 
+2.43.0
+

@@ -1,0 +1,150 @@
+From 53deb98f61415249fedc35d303f8921f80bf2729 Mon Sep 17 00:00:00 2001
+From: huangzhao <huangzhao@WIN-TLG0U98OLAE>
+Date: Tue, 27 Oct 2026 09:13:28 +0800
+Subject: [PATCH 3/5] =?UTF-8?q?ccs:=20TC358743=20=E5=BB=B6=E8=BF=9F?=
+ =?UTF-8?q?=E8=A7=A3=E9=9D=99=E9=9F=B3=20=E2=80=94=20=E9=94=81=E5=AE=9A?=
+ =?UTF-8?q?=E7=A8=B3=E5=AE=9A=E5=90=8E=E5=BB=BA=E5=B8=A7=EF=BC=8C=E7=9B=B8?=
+ =?UTF-8?q?=E4=BD=8D=E9=92=89=E5=B8=B8=E6=95=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+失锁/未锁期间按住 VI_MUTE 强制静音（AUTO_MUTE 不会在锁定瞬态
+的垃圾同步上建帧），work_unmute 自续 1Hz 监控，连续锁定 4s 后
+才解除强制静音。开流/重锁/服务重启全路径的相位都收敛到常数
+C0=0（2026-10-26 延迟解静音实验 5/5），开机不再摇骰。
+---
+ drivers/media/i2c/tc35874x.c | 61 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 59 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/i2c/tc35874x.c b/drivers/media/i2c/tc35874x.c
+index 060a54c35..8684b0824 100644
+--- a/drivers/media/i2c/tc35874x.c
++++ b/drivers/media/i2c/tc35874x.c
+@@ -202,6 +202,12 @@ struct tc35874x_state {
+ 
+ 	struct delayed_work delayed_work_enable_hotplug;
+ 
++	/* CCS 延迟解静音：TMDS 锁定稳定后再解除强制静音建帧，
++	 * 把 CSI TX 帧相位钉回常数（见 enable_stream 注释） */
++	struct delayed_work work_unmute;
++	unsigned long lock_since;	/* 连续锁定的起始时刻，0=未锁定 */
++	bool stream_on;			/* 应用层已请求开流 */
++
+ 	struct timer_list timer;
+ 	struct work_struct work_i2c_poll;
+ 
+@@ -673,6 +679,42 @@ static inline void tc35874x_sleep_mode(struct v4l2_subdev *sd, bool enable)
+ 			enable ? MASK_SLEEP : 0);
+ }
+ 
++/* CCS 延迟解静音监控（自续 1Hz，开流期间常驻）：
++ * VI_MUTE 解静音瞬间 CSI TX 会以当时的输入同步位置重建帧结构，
++ * 若恰逢锁定瞬态的垃圾同步，相位就是随机的（画面垂直卷动的根源）。
++ * 这里在失锁/未锁期间按住强制静音（AUTO_MUTE 不会在瞬态建帧），
++ * 等 TMDS 连续锁定稳定 4s 后才解除强制静音，让帧结构在干净锁定下
++ * 重建——实测相位收敛到常数 C0=0（2026-10-26，5/5）。 */
++static void tc35874x_work_unmute(struct work_struct *work)
++{
++	struct tc35874x_state *state = container_of(to_delayed_work(work),
++			struct tc35874x_state, work_unmute);
++	struct v4l2_subdev *sd = &state->sd;
++
++	if (!state->stream_on)
++		return;
++
++	if (no_signal(sd) || no_sync(sd)) {
++		if (!(i2c_rd8(sd, VI_MUTE) & MASK_VI_MUTE))
++			v4l2_info(sd, "ccs: sync lost, force mute\n");
++		i2c_wr8(sd, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
++		state->lock_since = 0;
++		schedule_delayed_work(&state->work_unmute, HZ);
++		return;
++	}
++	if (!state->lock_since)
++		state->lock_since = jiffies;
++	if (time_before(jiffies, state->lock_since + 4 * HZ)) {
++		schedule_delayed_work(&state->work_unmute, HZ / 2);
++		return;
++	}
++	if (i2c_rd8(sd, VI_MUTE) & MASK_VI_MUTE) {
++		i2c_wr8(sd, VI_MUTE, MASK_AUTO_MUTE);
++		v4l2_info(sd, "ccs: deferred unmute after stable lock\n");
++	}
++	schedule_delayed_work(&state->work_unmute, HZ);
++}
++
+ static inline void enable_stream(struct v4l2_subdev *sd, bool enable)
+ {
+ 	struct tc35874x_state *state = to_state(sd);
+@@ -687,8 +729,13 @@ static inline void enable_stream(struct v4l2_subdev *sd, bool enable)
+ 		i2c_wr32(sd, TXOPTIONCNTRL, 0);
+ 		/* Set to continuous mode to trigger LP11->HS transition */
+ 		i2c_wr32(sd, TXOPTIONCNTRL, MASK_CONTCLKMODE);
+-		/* Unmute video */
+-		i2c_wr8(sd, VI_MUTE, MASK_AUTO_MUTE);
++		/* CCS 延迟解静音：不立即解。锁定瞬态的同步位置是垃圾，
++		 * 此时建帧相位随机（卷动根源）。按住强制静音，交给
++		 * work_unmute 等锁定稳定后再解，相位钉回常数。
++		 * 信号可能早已锁好，4s 保守等待从此刻起算。 */
++		i2c_wr8(sd, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
++		state->lock_since = jiffies;
++		schedule_delayed_work(&state->work_unmute, HZ / 2);
+ 	} else {
+ 		/* Mute video so that all data lanes go to LSP11 state.
+ 		 * No data is output to CSI Tx block. */
+@@ -1697,6 +1744,8 @@ static int tc35874x_g_mbus_config(struct v4l2_subdev *sd,
+ 
+ static int tc35874x_s_stream(struct v4l2_subdev *sd, int enable)
+ {
++	struct tc35874x_state *state = to_state(sd);
++
+ 	/* CCS 实验：信号已锁且 TX 已在输出时不重启 TX。
+ 	 * VI_MUTE 解静音瞬间 CSI TX 会在输入帧随机位置重建帧结构，
+ 	 * 表现为画面垂直卷动且相位每次开流随机。保持 TX 常开，
+@@ -1707,13 +1756,18 @@ static int tc35874x_s_stream(struct v4l2_subdev *sd, int enable)
+ 		 * 补一个时钟 lane 的 LP11->HS 跳变让它重新同步 */
+ 		i2c_wr32(sd, TXOPTIONCNTRL, 0);
+ 		i2c_wr32(sd, TXOPTIONCNTRL, MASK_CONTCLKMODE);
++		state->stream_on = true;
++		/* 解静音态下的失锁监控（服务重启后监控可能没在跑） */
++		schedule_delayed_work(&state->work_unmute, HZ);
+ 		v4l2_info(sd, "ccs: tx already running, resync clk lane only\n");
+ 		return 0;
+ 	}
+ 	if (!enable) {
++		state->stream_on = false;
+ 		v4l2_info(sd, "ccs: keep tx running on s_stream(0)\n");
+ 		return 0;
+ 	}
++	state->stream_on = true;
+ 	enable_stream(sd, enable);
+ 	return 0;
+ }
+@@ -2415,6 +2469,7 @@ static int tc35874x_probe(struct i2c_client *client,
+ 
+ 	INIT_DELAYED_WORK(&state->delayed_work_enable_hotplug,
+ 			tc35874x_delayed_work_enable_hotplug);
++	INIT_DELAYED_WORK(&state->work_unmute, tc35874x_work_unmute);
+ 
+ 	tc35874x_initial_setup(sd);
+ 
+@@ -2463,6 +2518,7 @@ static int tc35874x_probe(struct i2c_client *client,
+ err_work_queues:
+ 	if (!state->i2c_client->irq)
+ 		flush_work(&state->work_i2c_poll);
++	cancel_delayed_work(&state->work_unmute);
+ 	cancel_delayed_work(&state->delayed_work_enable_hotplug);
+ 	mutex_destroy(&state->confctl_mutex);
+ err_hdl:
+@@ -2480,6 +2536,7 @@ static int tc35874x_remove(struct i2c_client *client)
+ 		del_timer_sync(&state->timer);
+ 		flush_work(&state->work_i2c_poll);
+ 	}
++	cancel_delayed_work_sync(&state->work_unmute);
+ 	cancel_delayed_work(&state->delayed_work_enable_hotplug);
+ 	v4l2_async_unregister_subdev(sd);
+ 	v4l2_device_unregister_subdev(sd);
+-- 
+2.43.0
+

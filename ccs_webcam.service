@@ -1,0 +1,19 @@
+# /etc/systemd/system/ccs_webcam.service — CCS 采集网页服务（预览+面板+KVM 注入）
+# 安装：cp ccs_webcam.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable ccs_webcam
+[Unit]
+Description=CCS HDMI capture web preview + KVM HID injection
+# 依赖 ccs.service 先完成外设初始化（HID gadget、EDID 写入）
+After=ccs.service
+Wants=ccs.service
+
+[Service]
+Type=simple
+# 启动前恢复采集通道（无句柄状态下切换，杜绝 unbind 竞态）
+ExecStartPre=/usr/sbin/ccs_channel_apply.sh
+ExecStart=/usr/sbin/ccs_webcam.py --port 8080
+# 采集循环自身有 watchdog/对齐重试；进程真死了由 systemd 拉起
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

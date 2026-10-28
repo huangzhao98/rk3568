@@ -1,0 +1,12 @@
+[Unit]
+Description=CCS network fallback (static -> DHCP if unreachable)
+After=systemd-networkd.service
+Wants=systemd-networkd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ccs_netwatch.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

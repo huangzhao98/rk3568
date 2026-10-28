@@ -1,0 +1,135 @@
+From 5e77f828c8d434f6a46d699c7f9231818c4780d7 Mon Sep 17 00:00:00 2001
+From: huangzhao <huangzhao@local>
+Date: Tue, 27 Oct 2026 10:12:15 +0800
+Subject: [PATCH 4/5] =?UTF-8?q?tc35874x:=20i2c=E6=8C=82=E6=AD=BB=E8=87=AA?=
+ =?UTF-8?q?=E6=95=91=E5=A4=8D=E4=BD=8D=20+=20no=5Fsignal/no=5Fsync=20?=
+ =?UTF-8?q?=E9=94=99=E8=AF=AF=E5=80=BC=E5=AE=89=E5=85=A8=E6=96=B9=E5=90=91?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- work_unmute 每次运行先读 SYS_STATUS：读失败(负 errno)计 i2c_errs，
+  连续8次(~8s)打复位脚重建寄存器(initial_setup+pll+csi+色彩空间+
+  中断+EDID)，保持强制静音等信号稳定后再解，相位重新钉常数。
+  不 unbind 驱动，media 链路/rkcif 流/用户态 fd 全不动。
+- no_signal/no_sync：i2c 读失败按无信号处理(负数值位全1会被误判成
+  信号+同步都在，挂死期间解静音逻辑彻底失效)。
+- 修复热拔插后冻结只能整机重启(2026-10-27 实测)。
+---
+ drivers/media/i2c/tc35874x.c | 64 ++++++++++++++++++++++++++++++++++--
+ 1 file changed, 61 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/i2c/tc35874x.c b/drivers/media/i2c/tc35874x.c
+index 8684b0824..96d5634ef 100644
+--- a/drivers/media/i2c/tc35874x.c
++++ b/drivers/media/i2c/tc35874x.c
+@@ -206,6 +206,7 @@ struct tc35874x_state {
+ 	 * 把 CSI TX 帧相位钉回常数（见 enable_stream 注释） */
+ 	struct delayed_work work_unmute;
+ 	unsigned long lock_since;	/* 连续锁定的起始时刻，0=未锁定 */
++	unsigned int i2c_errs;		/* 连续 i2c 读失败计数（挂死自救用） */
+ 	bool stream_on;			/* 应用层已请求开流 */
+ 
+ 	struct timer_list timer;
+@@ -232,6 +233,13 @@ struct tc35874x_state {
+ 
+ static void tc35874x_enable_interrupts(struct v4l2_subdev *sd,
+ 		bool cable_connected);
++static void tc35874x_init_interrupts(struct v4l2_subdev *sd);
++static void tc35874x_enable_edid(struct v4l2_subdev *sd);
++static void tc35874x_set_pll(struct v4l2_subdev *sd);
++static void tc35874x_set_csi(struct v4l2_subdev *sd);
++static void tc35874x_set_csi_color_space(struct v4l2_subdev *sd);
++static void tc35874x_initial_setup(struct v4l2_subdev *sd);
++static void tc35874x_gpio_reset(struct tc35874x_state *state);
+ static int tc35874x_s_ctrl_detect_tx_5v(struct v4l2_subdev *sd);
+ static int tc35874x_s_dv_timings(struct v4l2_subdev *sd,
+ 				 struct v4l2_dv_timings *timings);
+@@ -396,12 +404,19 @@ static inline bool tx_5v_power_present(struct v4l2_subdev *sd)
+ 
+ static inline bool no_signal(struct v4l2_subdev *sd)
+ {
+-	return !(i2c_rd8(sd, SYS_STATUS) & MASK_S_TMDS);
++	int v = i2c_rd8(sd, SYS_STATUS);
++
++	/* i2c 读失败（芯片挂死）返回负 errno，负数值位全 1 会被误判成
++	 * "信号+同步都在"，挂死期间解静音逻辑彻底失效（2026-10-27 实测
++	 * 热拔插后冻结只能重启）。失败按无信号处理：保持静音、继续轮询 */
++	return v < 0 || !(v & MASK_S_TMDS);
+ }
+ 
+ static inline bool no_sync(struct v4l2_subdev *sd)
+ {
+-	return !(i2c_rd8(sd, SYS_STATUS) & MASK_S_SYNC);
++	int v = i2c_rd8(sd, SYS_STATUS);
++
++	return v < 0 || !(v & MASK_S_SYNC);
+ }
+ 
+ static inline bool audio_present(struct v4l2_subdev *sd)
+@@ -679,6 +694,38 @@ static inline void tc35874x_sleep_mode(struct v4l2_subdev *sd, bool enable)
+ 			enable ? MASK_SLEEP : 0);
+ }
+ 
++/* CCS 自救复位：芯片 i2c 挂死（连续读失败）时打复位脚并重建寄存器。
++ * 不 unbind 驱动——media 链路、rkcif 流、用户态 fd 全部保持不动，
++ * 恢复后帧自然回来；复位后保持强制静音，信号稳定 4s 再由 work_unmute
++ * 解静音建帧，相位重新钉回常数（2026-10-27：挂死只能整机重启的实测
++ * 教训，见 50_内核定制修改存档.md §16） */
++static void tc35874x_self_reset(struct tc35874x_state *state)
++{
++	struct v4l2_subdev *sd = &state->sd;
++
++	v4l2_info(sd, "ccs: i2c wedged, self reset\n");
++#ifdef CONFIG_OF
++	if (state->reset_gpio)
++		tc35874x_gpio_reset(state);
++#endif
++	tc35874x_initial_setup(sd);
++	if (state->timings.bt.width) {
++		/* 复位后寄存器全丢：s_dv_timings 会因"时序无变化"跳过重
++		 * 编程，这里无条件重建 PLL/CSI/色彩空间 */
++		tc35874x_set_pll(sd);
++		tc35874x_set_csi(sd);
++		tc35874x_set_csi_color_space(sd);
++	}
++	tc35874x_init_interrupts(sd);
++	if (tx_5v_power_present(sd))
++		tc35874x_enable_edid(sd);
++	else
++		tc35874x_enable_interrupts(sd, false);
++	i2c_wr8(sd, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
++	state->lock_since = 0;
++	state->i2c_errs = 0;
++}
++
+ /* CCS 延迟解静音监控（自续 1Hz，开流期间常驻）：
+  * VI_MUTE 解静音瞬间 CSI TX 会以当时的输入同步位置重建帧结构，
+  * 若恰逢锁定瞬态的垃圾同步，相位就是随机的（画面垂直卷动的根源）。
+@@ -690,11 +737,22 @@ static void tc35874x_work_unmute(struct work_struct *work)
+ 	struct tc35874x_state *state = container_of(to_delayed_work(work),
+ 			struct tc35874x_state, work_unmute);
+ 	struct v4l2_subdev *sd = &state->sd;
++	int sys;
+ 
+ 	if (!state->stream_on)
+ 		return;
+ 
+-	if (no_signal(sd) || no_sync(sd)) {
++	sys = i2c_rd8(sd, SYS_STATUS);
++	if (sys < 0) {
++		/* i2c 不应答 = 芯片挂死：连续 ~8s 自救复位一次 */
++		if (++state->i2c_errs >= 8)
++			tc35874x_self_reset(state);
++		schedule_delayed_work(&state->work_unmute, HZ);
++		return;
++	}
++	state->i2c_errs = 0;
++
++	if (!(sys & MASK_S_TMDS) || !(sys & MASK_S_SYNC)) {
+ 		if (!(i2c_rd8(sd, VI_MUTE) & MASK_VI_MUTE))
+ 			v4l2_info(sd, "ccs: sync lost, force mute\n");
+ 		i2c_wr8(sd, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
+-- 
+2.43.0
+
