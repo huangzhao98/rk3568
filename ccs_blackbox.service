@@ -1,0 +1,8 @@
+[Unit]
+Description=CCS blackbox dmesg recorder
+After=local-fs.target
+[Service]
+ExecStart=/usr/sbin/ccs_blackbox.sh
+Restart=always
+[Install]
+WantedBy=multi-user.target
