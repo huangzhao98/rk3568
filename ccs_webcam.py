@@ -1718,18 +1718,21 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
             # 等满窗口是纯浪费）。一直 0 帧说明芯片还是被静音了（清锁存
             # 与驱动轮询赛跑输了），重试
             raw, stable, none_streak, t0 = None, 0, 0, time.time()
-            recent = []                  # 最近 3 帧：接缝检测的时间稳定性验证用
+            recent = []                  # 最近 3 帧：内容测量链（最后兜底）用
             last_km = None               # 上一帧测量 (k, via)
             k, conf, m = 0, False, 'none'
             bootstrap = cap.ref is None and _pinned_roll(w, h) is None
-            if bootstrap and not hpd_done and tc and not clean_start:
-                # bootstrap（量产首烧/状态丢失）：瞬态帧的 split 假阳性会污染
-                # 钉值+参考帧（2026-10-28 实测首烧 split 报 695 真值 0，随后
-                # 全链路被带歪），不如跳过测量直接干净重锁锚 0——确定性，
-                # 还省掉 15s 测量窗口。重锁失败（源不理会 HPD）才落回测量链
+            if not clean_start and not relocked and not hpd_done and tc:
+                # 零图像识别（2026-10-29 用户明确要求）：客户画面不可预测，
+                # 内容检测全链（split/taskbar/band/ref/seam）在静态设备 UI
+                # 上会稳定地自信报错值——实测 split 两帧一致报 677、ref
+                # 轮廓相关报 710（真值均 0），track 后台复测用 split 把
+                # 方正画面卷坏两次还落了盘。"两帧一致"闸门救不了：静态画面
+                # 的假阳性本来就是稳定的。相位锚点只用确定性手段：门控/
+                # 热启动钉值（上方快进）或直接 HPD 干净重锁钉 0；重锁失败
+                # （源不理会 HPD）才落回内容测量链做最后兜底
                 hpd_done = True
-                print("[align] bootstrap: 跳过瞬态测量，直接干净重锁锚定相位 0",
-                      flush=True)
+                print("[align] 跳过内容测量，直接干净重锁锚定相位 0", flush=True)
                 relocked = _hpd_clean_relock(tc)
                 if relocked:
                     cap.ref = None
@@ -1739,74 +1742,41 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                         except OSError:
                             pass
                 continue
-            win = 20 if (relocked or clean_start) else 6
-            # 有参考帧（热拔插恢复等）或门控放行（相位已被驱动钉 0）时内容
-            # 稳定门限 10→3 帧：ref 全帧相关/驱动钉定本身即强校验
-            # （2026-10-28 实测热拔插对齐 3s→~1s，对标树莓派）；
-            # 裸 bootstrap 无校验手段，维持 10 帧保守
-            stable_gate = 10 if (bootstrap and not clean_start) else 3
+            win = 20
+            stable_gate = 3 if (clean_start or relocked) else 10
             while time.time() - t0 < win:
                 f = cap.grab_latest(timeout=4)
                 if f is None:
                     none_streak += 1
-                    print(f"[align] dbg: no frame streak={none_streak}",
-                          flush=True)
                     if none_streak >= 5:             # ~20s 无一帧 → 放弃本轮
                         break
                     continue
                 none_streak = 0
                 cap.last_frame_ts = time.time()
-                rp = _row_profile(f, w, h).max()
-                if rp > 30:
+                if _row_profile(f, w, h).max() > 30:
                     stable += 1
                     raw = f
                     recent = (recent + [f])[-3:]
                 else:
-                    print(f"[align] dbg: unstable rp={rp}", flush=True)
                     stable = 0
                     last_km = None
                     continue
-                if clean_start:
-                    print(f"[align] dbg: cs stable={stable} gate={stable_gate}",
-                          flush=True)
                 if stable < stable_gate:
                     continue
-                if clean_start:
-                    # 门控快速路径：相位已被驱动钉 0，split/ref 只做 sanity
-                    # ——两帧一致的非零结果才推翻锚点；门控钉 0 下检测器的非零
-                    # 报值都是瞬态假阳性（实测首烧 split 报 695 真值 0），所以
-                    # 稳定 5 帧仍静默/自相矛盾 = 相位确为 0，直接采信锚点，
-                    # 不再干等 20s 窗口（首版漏把静默判定用于 conf2 分支，假
-                    # 阳性流把窗口耗光落入 11s 重锁，慢但结果仍对）
-                    k2, conf2, m2 = 0, False, 'none'
-                    sk = _split_fix(raw, w, h)
-                    if sk is not None:
-                        k2, conf2, m2 = sk, True, 'split'
-                    elif cap.ref is not None:
-                        rk, rc = _measure_roll(raw, cap.ref, w, h)
-                        if rc:
-                            k2, conf2, m2 = rk, True, 'ref'
-                    if conf2 and last_km is not None and \
-                            min((k2 - last_km[0]) % h,
-                                (last_km[0] - k2) % h) <= 3:
-                        k, conf, m = k2, True, m2
-                        break
-                    last_km = (k2, m2) if conf2 else None
-                    print(f"[align] dbg: cs sk={sk} k2={k2} conf2={conf2} "
-                          f"stable={stable}", flush=True)
+                if clean_start or relocked:
+                    # 确定性锚点路径：相位已被驱动（门控/延迟解静音）或干净
+                    # 重锁钉 0，只等内容稳定确认流正常即采信，不做任何内容
+                    # 检测（2026-10-29 零图像识别，见上）
                     if stable >= 5:
-                        k, conf, m = 0, True, 'gated'
+                        k, conf, m = 0, True, \
+                            'gated' if clean_start else 'relock'
                         break
                     continue
+                # 最后兜底：HPD 重锁失败（源不理会）后才走内容测量链
                 k2, conf2, m2 = _measure_phase(raw, recent, cap.ref, w, h,
                                                bootstrap)
                 if not conf2:
                     last_km = None
-                    # 重锁后相位锚 0，画面方正时检测器静默是预期：稳定 5 帧
-                    # 内容没变还没测出东西 = 没有特征可测，立即采信锚点
-                    # （原来干等 10s）；重锁本身已含 8s 稳定确认，无需再等
-                    if relocked and (time.time() - t0 > 10 or stable >= 5):
-                        break        # 重锁后画面已稳定且静默（预期），采信锚点
                     continue
                 if last_km is not None and min((k2 - last_km[0]) % h,
                                                (last_km[0] - k2) % h) <= 3:
@@ -1816,14 +1786,6 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                     print(f"[align] transient? {last_km[0]}->{k2} via={m2}, "
                           f"keep waiting", flush=True)
                 last_km = (k2, m2)
-            # 干净重锁后的弱检测守卫：重锁锚定相位 0，任务栏/横带/接缝在
-            # 方正画面上的假阳性（实测无任务栏设置页 via=taskbar 报 338）
-            # 与锚点矛盾，一律改判 0。split 是绝对锚点仍采信
-            if conf and relocked and m in ('taskbar', 'band', 'seam') \
-                    and min(k, h - k) > 10:
-                print(f"[align] reject k={k} via={m}: conflicts relock "
-                      f"anchor 0", flush=True)
-                k, conf, m = 0, True, 'relock'
             if not conf and not hpd_done and tc:
                 # 测不出（无参照物均匀画面/一帧没来）→ 自动干净重锁：源响应
                 # HPD 会从帧边界重启输出，TX 帧结构重建后相位恒为 0——确定性
@@ -2667,71 +2629,6 @@ def render_page(cap, subdev, msg='', err=''):
 </body></html>"""
 
 
-def _track_child(job_rx, res_tx):
-    """相位复测子进程。1080p 全帧检测 ~1.3s（_taskbar_roll 为主），在采集
-    进程的任何线程里跑都会抢 GIL 把编码拖慢 2 倍（33→80ms，2026-09-21
-    实测）——独立进程彻底隔离。协议：收 (raw, w, h, ref, roll, epoch)，
-    有确信的相位变化回 (k2, via, epoch)，否则回 None。epoch 是 roll 代际，
-    父进程只回收代际仍匹配的结果（nudge/重对齐后在飞结果作废）。检测顺序
-    按可信度：
-    分截签名 → 任务栏结构 → 浮动横带 → 参考帧相关（自我一致，参考帧错了
-    会跟着错）。参考帧不落盘（track 曾在 EDID 切换瞬态帧上误判写盘，投毒
-    扩散到后续所有对齐）。
-    接缝复检（2026-10-26 新增、10-27 禁用）：曾用跨调用累积接缝候选做隐
-    错位兜底，但实测误报率无法接受——一天内三次把正确画面卷坏（19→436
-    锁屏误判 / 338→60 / 60→442）。延迟解静音驱动把相位钉在建帧时刻后，
-    track seam 失去了存在的场景，已从复测链路移除；seam 只保留在 align
-    里做无参考帧时的新源自举（不持久化、不进参考帧）。"""
-    while True:
-        try:
-            raw, w, h, ref, roll, epoch = job_rx.recv()
-        except (EOFError, OSError):
-            break                            # 父进程退出，跟着退
-        try:
-            k2, conf2, m2 = (0, False, 'none')
-            sk2 = _split_fix(raw, w, h)
-            if sk2 is not None:
-                k2, conf2, m2 = sk2, True, 'split'
-            if not conf2:
-                tk2 = _taskbar_roll(raw, w, h)
-                if tk2 is None:
-                    tk2 = _taskbar_roll_cwf(raw, w, h)
-                if tk2 is not None:
-                    k2, conf2, m2 = tk2, True, 'taskbar'
-            if not conf2:
-                fb2 = _floating_band_roll(raw, w, h)
-                if fb2 is not None:
-                    k2, conf2, m2 = fb2, True, 'band'
-            if not conf2 and ref is not None:
-                k2, conf2 = _measure_roll(raw, ref, w, h)
-                if conf2:
-                    m2 = 'ref'
-            # 接缝复检已禁用（2026-10-27）：补丁驱动下相位由延迟解静音钉住，
-            # track seam 失去了存在的场景，而它的误报率实测无法接受——一天内
-            # 三次把正确画面卷坏（19→436 锁屏误判 / 338→60 / 60→442）。seam
-            # 只保留在 align 里做无参考帧时的新源自举（不持久化、不进参考帧）。
-            # ±3 行内的微差不动（2026-10-26）：相位在会话内恒定，复测的
-            # ±1~2 行差异是检测器窗口量化误差（已对齐帧上任务栏法实测会答
-            # 718≈-2），采纳反而把好画面卷偏；真正的相位重摇都是大跳变
-            if conf2 and min((k2 - roll) % h, (roll - k2) % h) > 3:
-                st0 = w * 2
-                out0 = raw[-k2 * st0:] + raw[:-k2 * st0] if k2 else raw
-                if _split_fix(out0, w, h) is not None:
-                    print(f"[roll] reject track k={k2} via={m2}: still split", flush=True)
-                    res_tx.send(None)
-                else:
-                    res_tx.send((k2, m2, epoch))
-            else:
-                res_tx.send(None)
-        except Exception as e:
-            print(f"[track] error: {e!r}", flush=True)
-            try:
-                res_tx.send(None)
-            except (BrokenPipeError, OSError):
-                break
-    os._exit(0)
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--port', type=int, default=8080)
@@ -2741,13 +2638,9 @@ def main():
     ap.add_argument('--dev', default='/dev/video0')
     args = ap.parse_args()
 
-    # 相位复测子进程（GIL 隔离，见 _track_child docstring）。每 150 帧
-    # （~5s）投递一帧；fork 在打开任何设备/线程之前，子进程不碰硬件
-    job_rx, job_tx = multiprocessing.Pipe(duplex=False)
-    res_rx, res_tx = multiprocessing.Pipe(duplex=False)
-    multiprocessing.Process(target=_track_child, args=(job_rx, res_tx),
-                            daemon=True).start()
-    track_pending = False
+    # track 后台相位复测已整体移除（2026-10-29 零图像识别，见采集循环
+    # 注释）：内容检测在客户不可预测画面上稳定误报，相位漂移由驱动
+    # relock_dirty + phase_suspect 确定性接管
 
     subdev = find_subdev()
     if not os.path.exists('/dev/hidg0'):     # USB HID gadget（键盘/鼠标/触摸）
@@ -2789,7 +2682,6 @@ def main():
     _TIMING = bool(os.environ.get('CCS_TIMING'))
 
     def loop():
-        nonlocal track_pending
         # 首次对齐在采集线程里做：开机对齐现在最长 ~100s（测量+干净重锁+
         # 复核），若在主线程阻塞，HTTP 服务要等对齐完才绑定，开机头两分钟
         # 网页打不开（2026-10-27 用户反馈）。挪进来后网页立即可开，
@@ -2860,62 +2752,11 @@ def main():
                     empty = 0
                     cap.last_frame_ts = time.time()
                     tg += time.time() - _t; _t = time.time()
-                    # 相位持续跟踪：对齐后驱动仍可能因残留锁存触发 format_change
-                    # 静音+重开流把相位改随机（dmesg 实测），每 150 帧（~5s）
-                    # 投递一帧给独立 track 子进程复测（1080p 全帧检测 ~1.3s，
-                    # 在本进程任何线程里跑都会抢 GIL 把编码拖慢 2 倍，实测
-                    # 33→80ms），变了就更新 cap.roll 自愈。投递是引用+管道
-                    # 拷贝 ~5ms；结果异步回收，只回写 roll/ref（原子赋值）。
-                    chk = getattr(cap, '_rollchk', 0) + 1
-                    if chk >= 150:
-                        chk = 0
-                        if (not track_pending
-                                and time.time() - getattr(cap, 'align_done_ts', 0) > 10):
-                            cap._track_frame = raw
-                            job_tx.send((raw, cap.w, cap.h, cap.ref, cap.roll,
-                                         cap.roll_epoch))
-                            track_pending = True
-                    if track_pending and res_rx.poll():
-                        r = res_rx.recv()
-                        track_pending = False
-                        frame0, cap._track_frame = cap._track_frame, None
-                        if r:
-                            k2, m2, ep2 = r
-                            if ep2 != cap.roll_epoch:
-                                # 投递后用户 nudge 或重对齐过：旧相位结果作废，
-                                # 否则会把用户刚调好的画面改回去（2026-09-22 实测）
-                                r = None
-                        if (r and not cap.roll_manual
-                                and frame0 is not None
-                                and len(frame0) == cap.w * cap.h * 2):
-                            k2, m2 = r[0], r[1]
-                            if m2 in ('taskbar', 'band', 'seam'):
-                                # 弱检测守卫（同 align）：只有任务栏/横带/接缝
-                                # 受持久化值约束；split/ref 有权推翻（相位钉定
-                                # 非 100%，2026-10-27 10:13 实测 ref=135 为真、
-                                # 钉值 707 已失效）
-                                kp = _pinned_roll(cap.w, cap.h)
-                                if kp is not None and min((k2 - kp) % cap.h,
-                                        (kp - k2) % cap.h) > 3:
-                                    print(f"[roll] reject track k={k2} via={m2}: "
-                                          f"deviates pinned {kp}", flush=True)
-                                    k2 = cap.roll
-                            if k2 != cap.roll:
-                                st0 = cap.w * 2
-                                print(f"[roll] track: {cap.roll} -> {k2} via={m2}",
-                                      flush=True)
-                                cap.roll = k2
-                                if m2 != 'seam':
-                                    _save_roll(cap)     # 相位恒定，修正结果重启保持
-                                    if cap.ref is not None:
-                                        cap.ref = frame0[-k2 * st0:] + frame0[:-k2 * st0] \
-                                            if k2 else frame0     # 只更新内存
-                                # 接缝是弱证据（锁屏/弱结构画面会误报）：只改内存
-                                # 相位救当前画面，不落盘、不碰参考帧。参考帧一旦被
-                                # 错误相位污染，之后所有 ref 相关测量都"自信地错"
-                                # 自我锁死（2026-10-27 实测：seam 误判 436 → ref 被
-                                # 污 → 手动重对齐 via=ref 置信锁 442，按钮失效）
-                    cap._rollchk = chk
+                    # track 后台相位复测已整体移除（2026-10-29 零图像识别）：
+                    # 它的内容检测链在客户设备 UI 上稳定误报——实测 split 把
+                    # 方正画面卷成 687→677 并经 _save_roll 落盘，重启后 ref
+                    # 相关又自信地报 710（真值均 0）。相位漂移由驱动
+                    # relock_dirty + phase_suspect 确定性接管（见 watchdog）
                     if cap.roll:
                         # 硬件卷动相位软件消卷（对齐时已测量，见 align_and_start）
                         # 乒乓 buffer 切片拷贝（4MB 一趟），替代 bytes 拼接
