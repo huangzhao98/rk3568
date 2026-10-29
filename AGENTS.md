@@ -24,32 +24,37 @@ systemd 服务 `ccs_webcam.service`）。
 - 每完成一项工作，追加记录到 `50_内核定制修改存档.md`，写清原因和验证结果
 - 板上 `/tmp` 下的临时测试脚本重启会丢，重要的放 ccs_dev
 
-## 已完成的核心工作（截至 2026-10-28）
+## 已完成的核心工作（截至 2026-10-29）
 
-1. **开机画面垂直卷动根治**（详见存档 §18 及追加）：
-   - 根因：HDMI 源一直在跑时采集卡开机，TC358743 在画面随机位置建帧，
-     产生固定垂直偏移；偏移只在锁定时产生，之后恒定，丢帧不影响
-   - 方案：**零图像识别**（§25，客户画面不可预测，静态画面假阳性是
-     稳定的，两帧一致闸门无效；track 曾把方正画面卷坏并落盘 677）。
-     对齐只认确定性锚点：HPD 门控钉 0（§23）、延迟解静音钉 0、
-     HPD 干净重锁钉 0（`_hpd_clean_relock`：HPD 拉低→源停输出→
-     3s 静默→拉高→等锁 8s，相位恒为 0）；track 后台复测已整体删除，
-     内容测量链只在"源不理会 HPD"时做最后兜底
-   - 持久化：`/var/lib/ccs_roll`（w h k）+ `/var/lib/ccs_ref.raw` 参考帧；
-     常态开机驱动 HPD 门控放行后 1~2s 采信锚点（via=gated，见 §23）
-   - 网页 `/realign` 按钮走同一机制，手动触发；钉值 0+干净时快速
-     采信瞬间完成，脏重锁时固定 HPD 重锁 ~11s（显示"对齐中"）
+1. **开机画面垂直卷动根治**（详见存档 §18 及追加，最终机制 §27）：
+   - 根因（§27 实锤）：卷动全部来自 **rkcif DMA 侧相位**（芯片 TX 帧
+     结构由延迟解静音保证对齐，偏移恒 0）。**首流/静音后/脏重锁后布防
+     早于 TX 出数 → 锁到帧中间，相位随机**；**TX 已流式时重启采集管线
+     → rkcif 按 FS 帧头重锁，相位恒 0**（4/4 实测 corr=1.000）
+   - 方案：**零图像识别**（§25）。对齐只认确定性锚点：HPD 门控放行→
+     首内容帧证明 TX 流式→**再 `_config_stream` 一次按帧头重锚钉 0**
+     （§27，全程 ~2s，reboot×3 全 shift=0）；phase_suspect 脏重锁走
+     clean_start 快锚 ~5s；HPD 干净重锁（`_hpd_clean_relock` 三态
+     返回：1 成功 / 0 源不理会 / 2 仍 dirty 可重试≤3 次）兜底
+   - 持久化：`/var/lib/ccs_roll`（w h k）+ `/var/lib/ccs_ref.raw` 参考帧
+   - 网页 `/realign` 按钮走同一机制，手动触发
+   - 已知未加固点：采集循环 kp==0 的 fast resume（拔插自愈）只有一次
+     _config_stream，历史实测拔插均能修好；若报拔插后仍卷，加固=
+     首帧后二次重启管线
 2. **网页 1s 可开**：首次对齐挪进采集线程，不再阻塞 HTTP 绑定
 3. **网页状态遮罩**：断线提示"无视频输入信号"，对齐中显示"对齐中…"
    （JS 2s 轮询 /stat，aligning 优先于无信号；sig_ok 看门狗每拍更新）
-4. **内核 tc35874x 驱动**（10 个 commit，见 kernel-patches/）：
+4. **内核 tc35874x 驱动**（11 个 commit，见 kernel-patches/）：
    HUB 供电识别、相位固定、延迟解静音、i2c 挂死自救、
    TMDS 在而 SYNC 超 60s 自救复位、热拔插提速、漏边恢复
    （芯片先于驱动锁定时轮询比对补走 format_change，否则时序
    卡死 640x480，见存档 §21）、HPD 门控（probe 起按住源端，
    应用层 set_fmt/s_stream 才放行，冷启动相位恒 0，对齐 ~5s，
    见存档 §23）、relock_dirty 脏重锁标记（中途重锁相位摇骰，
-   失锁期 TMDS 在=相位随机，用户态据此禁用钉值快进，见 §24）
+   失锁期 TMDS 在=相位随机，用户态据此禁用钉值快进，见 §24）、
+   probe 时 TMDS 在跑标 dirty + work_gatewatch 门控期 TMDS 监视
+   转干净 + work_unmute 失锁期"任一采样到 TMDS 消失即转干净"
+   （内核 #23，§27；这些标记现只影响快进和 watchdog 判定）
 5. **彩色细线保真：4:2:2 全链路**（§26）：细彩线变灰的根因是采集
    （gst NV12）和编码（vepu 输出恒 420，mpp HAL 写死）两处纵向色度
    砍半。现为 GstBE 采 NV16 + libjpeg-turbo 软编 4:2:2 shim
@@ -62,10 +67,12 @@ systemd 服务 `ccs_webcam.service`）。
 
 - **PHY_RST 寄存器 0x8535 永远不要用**：实验发现会导致永久失锁，
   HPD 重锁都救不回，只能断电重启
-- nudge（手动微调）是软件消卷，重启服务即失效，不能用来模拟硬件卷动；
-  要造随机相位只能重启板子
-- 服务重启会在驱动 1Hz tick 边界解静音，60.000Hz 源下相位不变
-  （tick=整数帧）；只有冷启动相位才随机
+- **rkcif DMA 相位规律（§27 实锤，旧认知全作废）**：首流/静音后/脏重锁
+  后布防早于 TX 出数 → 相位随机（实测卷 78~590 行）；TX 已流式时重启
+  采集管线 → 按 FS 帧头重锁，**相位恒 0**。想消卷就"信号流式后再
+  _config_stream 一次"；别再用"服务重启相位不变/只能重启板子造随机
+  相位"的旧模型推理
+- nudge（手动微调）是软件消卷，重启服务即失效，不能用来模拟硬件卷动
 - 板上 rkcif 驱动不支持 QUERY_DV_TIMINGS ioctl（返回 Inappropriate ioctl），
   测帧率用 `v4l2-ctl --stream-mmap --stream-count=N --stream-to=/dev/null`
 - 内容检测在客户无状态栏/均匀画面上原理性失效（接缝行均亮度跳变
@@ -90,6 +97,6 @@ systemd 服务 `ccs_webcam.service`）。
 1. `git clone git@github.com:huangzhao98/rk3568.git`（本仓库）
 2. `git clone git@github.com:huangzhao98/rk3568-kernel.git`（内核完整源码）
 3. 完整 SDK（几十个 GB，repo 管理）不在 GitHub 上，需要的话从原开发机
-   拷贝或用 rockchip 官方渠道重新同步，然后把 kernel-patches/ 里 10 个
+   拷贝或用 rockchip 官方渠道重新同步，然后把 kernel-patches/ 里 11 个
    补丁 `git am` 到 SDK 的 kernel 目录
 4. 读 `README_开发流程.md`、`61_文件地图.md` 建立全局认识

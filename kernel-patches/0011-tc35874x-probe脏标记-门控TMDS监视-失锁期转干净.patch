@@ -1,0 +1,145 @@
+From 27748a2f2a91feab15615c96e554d4851a4975f4 Mon Sep 17 00:00:00 2001
+From: huangzhao <huangzhao@WIN-TLG0U98OLAE>
+Date: Thu, 29 Oct 2026 11:58:12 +0800
+Subject: [PATCH] =?UTF-8?q?tc35874x:=20probe=E6=97=B6TMDS=E5=9C=A8?=
+ =?UTF-8?q?=E8=B7=91=E6=A0=87=E8=84=8F=E9=87=8D=E9=94=81=20+=20=E9=97=A8?=
+ =?UTF-8?q?=E6=8E=A7=E6=9C=9FTMDS=E7=9B=91=E8=A7=86=20+=20=E5=A4=B1?=
+ =?UTF-8?q?=E9=94=81=E6=9C=9F=E4=BB=BB=E4=B8=80=E9=87=87=E6=A0=B7=E5=88=B0?=
+ =?UTF-8?q?TMDS=E6=B6=88=E5=A4=B1=E5=8D=B3=E8=BD=AC=E5=B9=B2=E5=87=80?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- probe: TMDS已在跑(热重启芯片不断电源没停输出)则 relock_dirty=1，
+  首建帧前未观测到TMDS消失=RX未复位=相位随机，用户态据此放弃快进
+- 新增 work_gatewatch: 开流前 HZ/4 监视门控期，TMDS真消失即转干净，
+  避免干净重锁被probe脏初值误伤白走HPD重锁
+- work_unmute 失锁期语义修正: 原只在失锁起点采样且任一读数有TMDS即记脏，
+  HPD拉低后源晚1~2s才停输出导致起点必脏；改为任一采样到TMDS消失即转干净
+配套用户态 FS 帧头重锚(ccs_webcam.py §27): TX流式中重启采集管线，
+rkcif按FS短包重锁相位恒0(4/4实测corr=1.000)，rebootx3全shift=0
+---
+ drivers/media/i2c/tc35874x.c | 66 +++++++++++++++++++++++++++++++-----
+ 1 file changed, 58 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/media/i2c/tc35874x.c b/drivers/media/i2c/tc35874x.c
+index 01ae1814d..d222b877d 100644
+--- a/drivers/media/i2c/tc35874x.c
++++ b/drivers/media/i2c/tc35874x.c
+@@ -220,8 +220,10 @@ struct tc35874x_state {
+ 	unsigned long lock_since;	/* 连续锁定的起始时刻，0=未锁定 */
+ 	unsigned long nosync_since;	/* TMDS 在而 SYNC 丢失的起始时刻，0=正常 */
+ 	bool outage;			/* 处于失锁期（供 relock_dirty 首次采样） */
+-	int relock_dirty;		/* 本次失锁期间 TMDS 是否一直在跑
+-					 * （1=脏重锁，恢复后相位随机） */
++	int relock_dirty;		/* 失锁期间 TMDS 从未真消失过=1（脏重锁，
++					 * 恢复后相位随机）；probe 时 TMDS 已在跑
++					 * 也置 1，直到任何一次采样到 TMDS 消失 */
++	struct delayed_work work_gatewatch;	/* 门控期 TMDS 监视（开流前） */
+ 	unsigned int i2c_errs;		/* 连续 i2c 读失败计数（挂死自救用） */
+ 	bool stream_on;			/* 应用层已请求开流 */
+ 
+@@ -792,15 +794,17 @@ static void tc35874x_work_unmute(struct work_struct *work)
+ 	state->i2c_errs = 0;
+ 
+ 	if (!(sys & MASK_S_TMDS) || !(sys & MASK_S_SYNC)) {
+-		/* 失锁期间 TMDS 一直在跑 = 源没停输出，恢复时贴着飞行中的
+-		 * 画面继续，重锁相位随机（卷动）；TMDS 掉过 = 源停过输出，
+-		 * 恢复从帧边界重新出图，相位钉 0。全程任一读数有 TMDS 即
+-		 * 记脏，用户态在信号恢复后据此决定相位是否可疑 */
++		/* 失锁期间 TMDS 从未真消失 = 源没停输出，恢复时贴着飞行中
++		 * 的画面继续，重锁相位随机（卷动）；任一次采样到 TMDS 消失
++		 * = 源停过输出，RX 复位，恢复从帧边界重新出图，相位钉 0。
++		 * 原先只在失锁起点采样一次、且任一读数有 TMDS 即记脏——
++		 * HPD 拉低后源往往晚 1~2s 才停输出，起点必脏，干净重锁
++		 * 被误判成脏（2026-10-29 实测） */
+ 		if (!state->outage) {
+ 			state->outage = true;
+ 			state->relock_dirty = !!(sys & MASK_S_TMDS);
+-		} else if (sys & MASK_S_TMDS) {
+-			state->relock_dirty = 1;
++		} else if (!(sys & MASK_S_TMDS)) {
++			state->relock_dirty = 0;
+ 		}
+ 		relock_dirty = state->relock_dirty;
+ 		if (!(i2c_rd8(sd, VI_MUTE) & MASK_VI_MUTE))
+@@ -841,6 +845,31 @@ static void tc35874x_work_unmute(struct work_struct *work)
+ 	schedule_delayed_work(&state->work_unmute, HZ);
+ }
+ 
++/* CCS 门控期 TMDS 监视（probe 后、首次开流前常驻）：work_unmute 只在
++ * 开流后运行，门控等待期间源响应 HPD 停输出（TMDS 消失）没人看得见，
++ * relock_dirty 会停在 probe 时的脏初值上，用户态因此不敢采信相位、
++ * 每次都白走一遍 HPD 重锁。这里 HZ/4 轻量轮询，观测到 TMDS 真消失
++ * （RX 复位，之后重锁从帧边界重建）即转干净；开流后由 work_unmute
++ * 接管同一职责，本监视退出。 */
++static void tc35874x_work_gatewatch(struct work_struct *work)
++{
++	struct tc35874x_state *state = container_of(to_delayed_work(work),
++			struct tc35874x_state, work_gatewatch);
++	struct v4l2_subdev *sd = &state->sd;
++	int sys;
++
++	if (state->stream_on)
++		return;
++	sys = i2c_rd8(sd, SYS_STATUS);
++	if (sys >= 0 && !(sys & MASK_S_TMDS) && state->relock_dirty) {
++		state->relock_dirty = 0;
++		relock_dirty = 0;
++		v4l2_info(sd, "ccs: tmds stopped before first stream, "
++			      "relock will be clean\n");
++	}
++	schedule_delayed_work(&state->work_gatewatch, HZ / 4);
++}
++
+ static inline void enable_stream(struct v4l2_subdev *sd, bool enable)
+ {
+ 	struct tc35874x_state *state = to_state(sd);
+@@ -2644,9 +2673,28 @@ static int tc35874x_probe(struct i2c_client *client,
+ 	INIT_DELAYED_WORK(&state->delayed_work_enable_hotplug,
+ 			tc35874x_delayed_work_enable_hotplug);
+ 	INIT_DELAYED_WORK(&state->work_unmute, tc35874x_work_unmute);
++	INIT_DELAYED_WORK(&state->work_gatewatch, tc35874x_work_gatewatch);
+ 
+ 	tc35874x_initial_setup(sd);
+ 
++	/* CCS relock_dirty 开机初值：probe 时 TMDS 已在跑（热重启芯片不
++	 * 断电、源没停输出），首次建帧前若一直没观测到 TMDS 消失，RX 没
++	 * 经历过复位，重锁相位随机（画面卷动）——按脏标记，用户态据此
++	 * 放弃"门控放行相位钉 0"的快进，改走 HPD 干净重锁（2026-10-29
++	 * 实测：热重启门控窗只有 3s，Windows 来不及停输出，gatewatch
++	 * 转干净来不及，用户态盲信 roll=0 卷 590 行挂屏） */
++	{
++		int sys = i2c_rd8(sd, SYS_STATUS);
++
++		if (sys >= 0 && (sys & MASK_S_TMDS)) {
++			state->relock_dirty = 1;
++			relock_dirty = 1;
++			v4l2_info(sd, "ccs: tmds already running at probe, "
++				      "mark relock dirty\n");
++		}
++	}
++	schedule_delayed_work(&state->work_gatewatch, HZ / 4);
++
+ 	tc35874x_s_dv_timings(sd, &default_timing);
+ 
+ 	tc35874x_set_csi_color_space(sd);
+@@ -2696,6 +2744,7 @@ static int tc35874x_probe(struct i2c_client *client,
+ err_work_queues:
+ 	if (!state->i2c_client->irq)
+ 		flush_work(&state->work_i2c_poll);
++	cancel_delayed_work(&state->work_gatewatch);
+ 	cancel_delayed_work(&state->work_unmute);
+ 	cancel_delayed_work(&state->delayed_work_enable_hotplug);
+ 	mutex_destroy(&state->confctl_mutex);
+@@ -2715,6 +2764,7 @@ static int tc35874x_remove(struct i2c_client *client)
+ 		flush_work(&state->work_i2c_poll);
+ 	}
+ 	cancel_delayed_work_sync(&state->work_unmute);
++	cancel_delayed_work_sync(&state->work_gatewatch);
+ 	cancel_delayed_work(&state->delayed_work_enable_hotplug);
+ 	v4l2_async_unregister_subdev(sd);
+ 	v4l2_device_unregister_subdev(sd);
+-- 
+2.43.0
+

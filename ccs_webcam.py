@@ -1295,19 +1295,27 @@ def _hpd_clean_relock(tc):
     重建时相位恒为常数 C0（7/7 收敛）；静默不足（1.2s）曾失败一次，故静默
     3s 且要求源真的停输出（TMDS 消失）、重锁后连续 2s 稳定才算成功。
     之后相位=C0，配合持久化 roll（/var/lib/ccs_roll）无需任何画面参照物。
-    源不理会 HPD（不停输出）时返回 False，相位不变，无副作用。"""
+    返回值：1=干净重锁成功相位钉 0；0=源不理会 HPD（没停输出，重试无
+    意义）；2=重锁发生了但驱动仍标 dirty（源停得太晚/抖动，可重试）。
+    （2026-10-29：原先只看 has_signal 级别的 dropped，Windows 装死时
+    dropped=False 也照常宣布成功、把随机相位钉 0 落盘——实测卷动挂屏。
+    现在 dropped=False 直接判失败，且成功后必须驱动确认 dirty=0）"""
     HPD_CTL, SYS_STATUS = 0x8544, 0x8520
     try:
         tc.wr8(HPD_CTL, 0x00)                  # HPD 拉低 = 显示器拔出
         t0 = time.time()
         dropped = False
-        while time.time() - t0 < 5:            # 等源真的停输出
-            if not (tc.rd8(SYS_STATUS) & 0x02):
+        while time.time() - t0 < 10:           # 等源真的停输出（Windows
+            if not (tc.rd8(SYS_STATUS) & 0x02):  # 响应 HPD 可能要 5s+）
                 dropped = True
                 break
             time.sleep(0.2)
         time.sleep(3)                          # 充分静默
         tc.wr8(HPD_CTL, 0x01)                  # HPD 拉高 = 重新插入
+        if not dropped:
+            print("[align] hpd relock: 源不理会 HPD（输出未停），放弃",
+                  flush=True)
+            return 0
         t0, good = time.time(), 0
         # 源重出图的头几秒常伴随显示管线抖动（Windows 重初始化），2s 稳定
         # 判据可能在抖动中段误判（实测 boot 572 行卷动）：要求锁已连续
@@ -1316,16 +1324,23 @@ def _hpd_clean_relock(tc):
             if tc.rd8(SYS_STATUS) & 0x82 == 0x82:
                 good += 1
                 if good >= 8 and time.time() - t0 >= 8:
-                    print(f"[align] hpd clean relock ok (dropped={dropped})",
+                    # 驱动最终裁决：重锁期间 TMDS 真停过（dirty=0）相位才
+                    # 钉 0；装死/晚停的源会让芯片贴着飞行画面重锁，相位
+                    # 随机（2026-10-29 实测 boot 590 行卷动）
+                    if _relock_dirty():
+                        print("[align] hpd relock 后驱动仍标 dirty，"
+                              "相位随机不可信（可重试）", flush=True)
+                        return 2
+                    print("[align] hpd clean relock ok (dropped=True)",
                           flush=True)
-                    return True
+                    return 1
             else:
                 good = 0
             time.sleep(0.5)
     except OSError:
         pass
     print("[align] hpd clean relock failed/ignored", flush=True)
-    return False
+    return 0
 
 
 def _clear_latches_loop(tc, stop):
@@ -1697,7 +1712,7 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
             tc = None
         if tc:
             threading.Thread(target=_clear_latches_loop, args=(tc, stop), daemon=True).start()
-        hpd_done = False
+        hpd_tries = 0                    # HPD 重锁次数（脏重锁可重试，限 3 次）
         relocked = False                 # 本轮对齐是否已成功干净重锁（相位锚 0）
         t_deadline = time.time() + 150   # 全局截止：in_align 期间看门狗的挂死
                                          # 检测被屏蔽，绝不能让对齐无限拖——挂死
@@ -1724,14 +1739,16 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                 sh(f"v4l2-ctl -d {subdev} --set-subdev-fmt "
                    f"pad=0,width={w},height={h},code=0x2006")
                 t_gate = time.time()
+                sig_came = False
                 while time.time() - t_gate < 12 and time.time() < t_deadline:
                     if has_signal(subdev):
-                        clean_start = True
+                        sig_came = True
                         break
                     time.sleep(0.5)
-                if not clean_start:
+                if not sig_came:
                     break
                 _adopt_detected_timings()   # 门控期间无时序可采，放行后补采
+                clean_start = True
                 print("[align] 门控放行后信号到来：源从帧头出图，快速采信",
                       flush=True)
             elif _pinned_roll(cap.w, cap.h) == 0 and not cap.phase_suspect \
@@ -1745,6 +1762,14 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                 # 驱动标记跨服务重启仍在（2026-10-29）
                 clean_start = True
                 print("[align] 热启动+钉值0：相位不变，快速采信", flush=True)
+            elif cap.phase_suspect:
+                # 看门狗报脏重锁：中途重锁的数据缺口让 rkcif DMA 相位错位
+                # （2026-10-29 实测：强制静音造 1s 缺口卷 281 行）。不必
+                # HPD 重锁（~13s 还打扰源）——驱动的延迟解静音保证 TX 帧
+                # 结构对齐输入帧头，本 attempt 首帧后重启一次管线，rkcif
+                # 按帧头重锁相位恒 0（实测 4/4 corr=1.000），~5s 归正
+                clean_start = True
+                print("[align] 脏重锁后管线重启锚定相位 0", flush=True)
             _follow_source(cap, subdev)      # 源切了分辨率就跟过去（如强制 1080p）
             w, h = cap.w, cap.h
             if cap.ref is None:
@@ -1767,8 +1792,9 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
             recent = []                  # 最近 3 帧：内容测量链（最后兜底）用
             last_km = None               # 上一帧测量 (k, via)
             k, conf, m = 0, False, 'none'
+            fs_locked = False            # 本轮是否已在 TX 流式中重启过管线
             bootstrap = cap.ref is None and _pinned_roll(w, h) is None
-            if not clean_start and not relocked and not hpd_done and tc:
+            if not clean_start and not relocked and hpd_tries < 3 and tc:
                 # 零图像识别（2026-10-29 用户明确要求）：客户画面不可预测，
                 # 内容检测全链（split/taskbar/band/ref/seam）在静态设备 UI
                 # 上会稳定地自信报错值——实测 split 两帧一致报 677、ref
@@ -1776,10 +1802,12 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                 # 方正画面卷坏两次还落了盘。"两帧一致"闸门救不了：静态画面
                 # 的假阳性本来就是稳定的。相位锚点只用确定性手段：门控/
                 # 热启动钉值（上方快进）或直接 HPD 干净重锁钉 0；重锁失败
-                # （源不理会 HPD）才落回内容测量链做最后兜底
-                hpd_done = True
+                # （源不理会 HPD）才落回内容测量链做最后兜底。
+                # 返回 2（重锁发生了但驱动仍标脏）可重试，最多 3 次
+                hpd_tries += 1
                 print("[align] 跳过内容测量，直接干净重锁锚定相位 0", flush=True)
-                relocked = _hpd_clean_relock(tc)
+                r = _hpd_clean_relock(tc)
+                relocked = (r == 1)
                 if relocked:
                     cap.ref = None
                     for p in (ROLL_PATH, REF_PATH):
@@ -1787,6 +1815,10 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                             os.remove(p)
                         except OSError:
                             pass
+                elif r == 2:
+                    continue                # 脏重锁：直接重试，不等测量窗
+                else:
+                    hpd_tries = 3           # 源不理会 HPD：重试无意义
                 continue
             win = 20
             stable_gate = 3 if (clean_start or relocked) else 10
@@ -1810,9 +1842,21 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                 if stable < stable_gate:
                     continue
                 if clean_start or relocked:
-                    # 确定性锚点路径：相位已被驱动（门控/延迟解静音）或干净
-                    # 重锁钉 0，只等内容稳定确认流正常即采信，不做任何内容
-                    # 检测（2026-10-29 零图像识别，见上）
+                    # 确定性锚点路径：相位钉 0 的依据不是"源从帧头出图"的
+                    # 假设，而是 rkcif 在 TX 流式中重启管线时按帧头重新
+                    # 锁定 DMA 相位（2026-10-29 实证：开机首流在 TX 解静音
+                    # 前布防，锁到帧中间，卷 78/171 行；强制静音造 1s 数据
+                    # 缺口卷 281 行；TX 流式中重启管线后相位恒 0，4/4
+                    # corr=1.000）。首帧到来即证明 TX 已流式，此时再重启
+                    # 一次管线钉 0，不做任何内容检测
+                    if not fs_locked:
+                        print("[align] TX 已流式，重启管线按帧头重锁相位",
+                              flush=True)
+                        if not _config_stream(cap, w, h):
+                            break
+                        fs_locked = True
+                        raw, stable, t0 = None, 0, time.time()
+                        continue
                     if stable >= 5:
                         k, conf, m = 0, True, \
                             'gated' if clean_start else 'relock'
@@ -1832,17 +1876,18 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                     print(f"[align] transient? {last_km[0]}->{k2} via={m2}, "
                           f"keep waiting", flush=True)
                 last_km = (k2, m2)
-            if not conf and not hpd_done and tc:
+            if not conf and not relocked and hpd_tries < 3 and tc:
                 # 测不出（无参照物均匀画面/一帧没来）→ 自动干净重锁：源响应
                 # HPD 会从帧边界重启输出，TX 帧结构重建后相位恒为 0——确定性
                 # 复位而非摇骰（2026-10-27 实测：开机相位随机 135/600，重锁
                 # 后均归 0；历史 7/7），无论重锁前相位多少都归零，自动路径
-                # 同样安全。源不理会 HPD（不停输出）时返回 False，相位不变
-                # 无副作用，保留钉值做回退。每次对齐至多重锁一次，不会反复
-                # 打扰源
-                hpd_done = True
+                # 同样安全。源不理会 HPD（不停输出）时返回 0，相位不变
+                # 无副作用，保留钉值做回退；返回 2（脏重锁）可重试，连同
+                # 第一处调用点合计最多 3 次，不会反复打扰源
+                hpd_tries += 1
                 print("[align] 测不出相位 → 干净重锁锚定相位 0", flush=True)
-                relocked = _hpd_clean_relock(tc)
+                r = _hpd_clean_relock(tc)
+                relocked = (r == 1)
                 if relocked:
                     # 相位已归零重建：旧参考帧/持久化相位全部失效，连文件
                     # 一起清除防误导（下轮 _load_ref 会读回磁盘旧参考帧，
@@ -1853,6 +1898,10 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                             os.remove(p)
                         except OSError:
                             pass
+                elif r == 2:
+                    continue                # 脏重锁：直接重试，不等测量窗
+                else:
+                    hpd_tries = 3           # 源不理会 HPD：重试无意义
                 continue
             if raw is None:
                 continue
