@@ -43,6 +43,25 @@ try:
 except OSError:
     _mppj = None
 
+# libjpeg-turbo 4:2:2 软编 shim（ccs_dev/ljpeg422_shim.c →
+# /usr/lib/libljpeg422_shim.so）：vepu 硬编输出恒为 4:2:0（mpp HAL 写死），
+# 纵向色度砍半，1px 高的彩色细线与相邻背景行平均后饱和度掉光变灰；
+# 4:2:2 纵向色度全分辨率，细线颜色保住。内部双槽流水（一帧延迟），
+# 同步接口语义与 mpp shim 相同，存在时优先于硬编。
+try:
+    _lj = ctypes.CDLL('/usr/lib/libljpeg422_shim.so')
+    _lj.ljpeg_open.restype = ctypes.c_int
+    _lj.ljpeg_encode.restype = ctypes.c_int
+    _lj.ljpeg_encode.argtypes = [ctypes.c_char_p, ctypes.c_int,
+                                 ctypes.c_char_p, ctypes.c_int]
+    _lj.ljpeg_set_filter.argtypes = [ctypes.c_int, ctypes.c_int]
+    if _lj.ljpeg_open(64, 64) != 0:      # 探测运行环境（libjpeg ABI 等）
+        _lj = None
+    else:
+        _lj.ljpeg_close()
+except (OSError, AttributeError):
+    _lj = None
+
 # RGA 硬件缩放（>720p 的源降到 720p 再编码用）；老 shim 无此符号则回退 PIL 缩放
 _HAS_RGA = False
 if _mppj is not None:
@@ -648,7 +667,9 @@ class Capture:
         self._t_sc = 0.0             # CCS_TIMING 计时累加器
         self._t_hw = 0.0
         self._scbuf = None             # RGA 缩放输出缓冲（按编码几何分配）
-        if _mppj and _mppj.mppjpeg_open(self.ew, self.eh) == 0:
+        if _lj and _lj.ljpeg_open(self.ew, self.eh) == 0:
+            self.enc = 'sw422'     # 4:2:2 软编：细线保色（优先）
+        elif _mppj and _mppj.mppjpeg_open(self.ew, self.eh) == 0:
             self.enc = 'hw'
             # 双实例流水实测无收益：vepu 单引擎串行处理，submit/get 拆开
             # 只是换了等待位置（53fps 实测持平同步路径），且多一帧延迟——停用
@@ -795,9 +816,11 @@ class Capture:
         return raw if len(raw) == need else None
 
     def _sync_filter(self):
-        """把亮度/锐化参数下发给 C shim（硬编路径在 C 拷贝趟里完成补偿，
-        零额外耗时）；老 shim 无此符号则 python 侧 numpy 兜底（慢）。"""
-        if _HAS_FILTER:
+        """把亮度/锐化参数下发给 C shim（硬编/422软编路径在 C 拷贝趟里
+        完成补偿，零额外耗时）；老 shim 无此符号则 python 侧 numpy 兜底（慢）。"""
+        if _lj and self.enc == 'sw422':
+            _lj.ljpeg_set_filter(self.bright, self.sharp)
+        elif _HAS_FILTER and self.enc == 'hw':
             _mppj.mppjpeg_set_filter(self.bright, self.sharp)
 
     def set_bright(self, val):
@@ -867,18 +890,29 @@ class Capture:
         return out.tobytes()
 
     def _reopen_enc(self):
-        """源分辨率 follow 后按新编码几何重开 vepu 实例。与编码调用互斥
+        """源分辨率 follow 后按新编码几何重开编码器实例。与编码调用互斥
         （enc_lock）。注意：几何永远取 (ew,eh)——640x360 减半几何的
         close/open 实测会 wedge 内核，流畅档不走硬编无需切几何。"""
         with self.enc_lock:
-            if _mppj:
+            if self.enc == 'sw422' and _lj:
+                try:
+                    _lj.ljpeg_close()
+                except Exception:
+                    pass
+                self.enc = 'pil'
+            elif _mppj:
                 try:
                     _mppj.mppjpeg_close()
                 except Exception:
                     pass
-                self.enc = 'hw' if _mppj.mppjpeg_open(self.ew, self.eh) == 0 \
-                    else 'pil'
+                self.enc = 'pil'
                 self._pipe = False        # 流水实测无收益（单引擎串行），恒停用
+            if self.enc == 'pil':         # 按优先级重建：sw422 → hw → pil
+                if _lj and _lj.ljpeg_open(self.ew, self.eh) == 0:
+                    self.enc = 'sw422'
+                elif _mppj and _mppj.mppjpeg_open(self.ew, self.eh) == 0:
+                    self.enc = 'hw'
+            self._sync_filter()
             self._hwfail = 0
             self._hwbuf = None
             self._pi = 0
@@ -892,16 +926,16 @@ class Capture:
         （软编低分辨率下收益小）。采集分辨率高于 720p 先 RGA 缩放。"""
         import io
         _t = time.time()
-        hw = self.enc == 'hw' and not self.half    # 流畅永不走硬编（见上）
+        hw = self.enc in ('hw', 'sw422') and not self.half  # 流畅永不走 shim（见上）
         if (self.w, self.h) != (self.ew, self.eh):
             raw = self._scale_uyvy(raw)
         self._t_sc = getattr(self, '_t_sc', 0.0) + time.time() - _t
         _t = time.time()
         w, h = self.ew, self.eh
-        # 亮度/锐化补偿：硬编路径由 C shim 在编码拷贝趟里做（~3ms），
+        # 亮度/锐化补偿：shim 路径由 C 在编码拷贝趟里做（~3ms），
         # python 侧不能先动数据（否则双重补偿）；PIL 路径 / 老 shim 才在
         # python 侧 numpy 做
-        hw_filter = hw and _HAS_FILTER
+        hw_filter = hw and (self.enc == 'sw422' or _HAS_FILTER)
         if not hw_filter:
             raw = self._apply_bright(raw)
             if not self.half:
@@ -910,16 +944,20 @@ class Capture:
             with self.enc_lock:
                 if self._hwbuf is None or len(self._hwbuf) != len(raw):
                     self._hwbuf = ctypes.create_string_buffer(len(raw))
-                n = _mppj.mppjpeg_encode(_cp(raw), len(raw),
+                if self.enc == 'sw422':
+                    n = _lj.ljpeg_encode(_cp(raw), len(raw),
                                          self._hwbuf, len(self._hwbuf))
+                else:
+                    n = _mppj.mppjpeg_encode(_cp(raw), len(raw),
+                                             self._hwbuf, len(self._hwbuf))
             self._t_hw = getattr(self, '_t_hw', 0.0) + time.time() - _t
             if n > 0:
                 self._hwfail = 0
                 return self._hwbuf.raw[:n]
             self._hwfail += 1
-            if self._hwfail >= 3:                    # 连续失败永久回退软编
+            if self._hwfail >= 3:                    # 连续失败永久回退 PIL 软编
                 self.enc = 'pil'
-            if hw_filter:                            # 本帧硬编失败转软编，补做补偿
+            if hw_filter:                            # 本帧 shim 失败转 PIL，补做补偿
                 raw = self._apply_bright(raw)
                 raw = self._apply_sharp(raw)
         a = np.frombuffer(raw, dtype=np.uint8, count=w * h * 2)
@@ -939,7 +977,9 @@ class Capture:
         ycbcr = np.dstack([y, u, v])
         img = Image.frombytes('YCbCr', (ycbcr.shape[1], ycbcr.shape[0]), ycbcr.tobytes())
         out = io.BytesIO()
-        img.save(out, 'JPEG', quality=self.q)        # PIL 直存 YCbCr，不过 RGB
+        img.save(out, 'JPEG', quality=self.q, subsampling=1)
+        # PIL 直存 YCbCr 不过 RGB；subsampling=1 = 4:2:2，纵向色度全分辨率
+        # （默认 4:2:0 会把 1px 高彩色细线洗成灰色，同 vepu 硬编的毛病）
         return out.getvalue()
 
 
@@ -989,19 +1029,24 @@ class _H264Tap:
 
 
 class GstBE:
-    """GStreamer 采集后端：v4l2src(NV12) → tee → ① videoconvert →
-    caps(UYVY/WxH) → appsink(pull)；② mpph264enc → appsink(/h264 裸流)。
+    """GStreamer 采集后端：v4l2src(NV16) → tee → ① videoconvert →
+    caps(UYVY/WxH) → appsink(pull)；② videoconvert → NV12 → mpph264enc →
+    appsink(/h264 裸流)。
     与原生 ioctl 后端同接口（open/stream_on/stream_off/free/grab_latest），
     对齐序列、消卷、亮度/锐化、编码链全部复用不变。appsink pull 模式 +
     drop=true max-buffers=1 等效原生"排干队列取最新帧"；无需 GLib 主循环
     线程，bus 错误在 grab 时顺带回收。v4l2src 在进 PLAYING 时才做 S_FMT
     ——换分辨率必须整管线重建（build），不能只改 caps。
-    为什么采 NV12 再软转 UYVY：rkcif 驱动经 v4l2src 直接出 UYVY 时画面
-    左右对半复制+隔行梳齿（原生 ioctl 路径同格式正常，NV12 也正常，
+    为什么采 NV16 再软转 UYVY：rkcif 驱动经 v4l2src 直接出 UYVY 时画面
+    左右对半复制+隔行梳齿（原生 ioctl 路径同格式正常，半平面格式正常，
     疑驱动 UYVY out_fmt 的 cplanes/bpp 配置与 gst buffer 协商路径不合），
-    改采 NV12（实测干净）由 videoconvert 重排为 packed UYVY，720p 下
-    A55 耗时毫秒级，下游零改动。H264 支路直接吃 NV12 零转换进硬编；
-    mpph264enc 插件缺失时自动退化为无 H264 支路的单支路管线。"""
+    改采半平面格式由 videoconvert 重排为 packed UYVY，720p 下 A55 耗时
+    毫秒级，下游零改动。为什么 NV16 而非 NV12：NV12 是 4:2:0，纵向色度
+    砍半——1px 高的彩色细线与相邻背景行平均后饱和度掉光变灰（2026-10-29
+    客户实测）；NV16 是 4:2:2 与芯片输出同源，纵向色度全分辨率，配
+    libjpeg 4:2:2 软编保住细线颜色。H264 支路 mpph264enc 只吃 NV12，
+    经 videoconvert 转（H264 本就 4:2:0，无损失）；插件缺失时自动退化
+    为无 H264 支路的单支路管线。"""
     def __init__(self, cap):
         self.cap = cap
         self.pipe = None
@@ -1020,11 +1065,12 @@ class GstBE:
         try:
             self.pipe = Gst.parse_launch(
                 f'v4l2src device={self.cap.dev} ! '
-                f'video/x-raw,format=NV12,width={w},height={h} ! tee name=t '
+                f'video/x-raw,format=NV16,width={w},height={h} ! tee name=t '
                 't. ! queue max-size-buffers=2 leaky=downstream ! videoconvert ! '
                 f'video/x-raw,format=UYVY,width={w},height={h} ! '
                 'appsink name=sink drop=true max-buffers=1 sync=false emit-signals=false '
                 't. ! queue max-size-buffers=4 leaky=downstream ! '
+                'videoconvert ! video/x-raw,format=NV12 ! '
                 'mpph264enc bps=2000000 gop=30 ! '
                 'appsink name=h264sink drop=true max-buffers=4 sync=false emit-signals=false')
             self.h264sink = self.pipe.get_by_name('h264sink')
@@ -1032,7 +1078,7 @@ class GstBE:
             print(f"[gst] H264 支路不可用（{e}），退化为纯采集管线", flush=True)
             self.pipe = Gst.parse_launch(
                 f'v4l2src device={self.cap.dev} ! '
-                f'video/x-raw,format=NV12,width={w},height={h} ! '
+                f'video/x-raw,format=NV16,width={w},height={h} ! '
                 'videoconvert ! '
                 f'video/x-raw,format=UYVY,width={w},height={h} ! '
                 'appsink name=sink drop=true max-buffers=1 sync=false emit-signals=false')
@@ -1135,8 +1181,8 @@ def _config_stream(cap, w, h):
             cap.stream_on()
             time.sleep(0.5)          # S_FMT 发生在开流瞬间，回读前等一拍
             fmt = sho("v4l2-ctl -d /dev/video0 --get-fmt-video 2>/dev/null")
-            # v4l2src 节点格式是 NV12（UYVY 由 videoconvert 在管线内软转）
-            if f"{w}/{h}" in fmt and "'NV12'" in fmt:
+            # v4l2src 节点格式是 NV16（UYVY 由 videoconvert 在管线内软转）
+            if f"{w}/{h}" in fmt and "'NV16'" in fmt:
                 return True
             if attempt == 0:
                 print("[config] fmt confirm failed, adopt detected timings "
@@ -1975,10 +2021,10 @@ def watchdog(cap):
             # 驱动轮询杀流后 rkcif 节点格式会掉回 640x480/RG10 默认：
             # 信号在、帧也照流（绿屏），信号跳变检测发现不了，必须查节点格式。
             # 无信号时不查——否则初始 640x480 格式会让对齐空转浪费重试。
-            # gst 后端节点格式是 NV12（管线内 videoconvert 软转 UYVY），
+            # gst 后端节点格式是 NV16（管线内 videoconvert 软转 UYVY），
             # 按后端分别校验，否则 gst 模式下这里每拍都误触发重对齐
             fmt = sho(f"v4l2-ctl -d {cap.dev} --get-fmt-video 2>/dev/null")
-            want_pf = 'NV12' if cap.be_name == 'gst' else 'UYVY'
+            want_pf = 'NV16' if cap.be_name == 'gst' else 'UYVY'
             if ok and (f"{cap.w}/{cap.h}" not in fmt or f"'{want_pf}'" not in fmt):
                 cap.need_realign.set()
 
