@@ -39,13 +39,14 @@ systemd 服务 `ccs_webcam.service`）。
 2. **网页 1s 可开**：首次对齐挪进采集线程，不再阻塞 HTTP 绑定
 3. **网页状态遮罩**：断线提示"无视频输入信号"，对齐中显示"对齐中…"
    （JS 2s 轮询 /stat，aligning 优先于无信号；sig_ok 看门狗每拍更新）
-4. **内核 tc35874x 驱动**（9 个 commit，见 kernel-patches/）：
+4. **内核 tc35874x 驱动**（10 个 commit，见 kernel-patches/）：
    HUB 供电识别、相位固定、延迟解静音、i2c 挂死自救、
    TMDS 在而 SYNC 超 60s 自救复位、热拔插提速、漏边恢复
    （芯片先于驱动锁定时轮询比对补走 format_change，否则时序
    卡死 640x480，见存档 §21）、HPD 门控（probe 起按住源端，
    应用层 set_fmt/s_stream 才放行，冷启动相位恒 0，对齐 ~5s，
-   见存档 §23）
+   见存档 §23）、relock_dirty 脏重锁标记（中途重锁相位摇骰，
+   失锁期 TMDS 在=相位随机，用户态据此禁用钉值快进，见 §24）
 5. **性能**：采集 60fps 满帧（实测），编码输出 ~45fps（RGA 缩放+硬编
    ~22ms/帧，信箱丢中间帧，不是采集问题）
 
@@ -62,6 +63,11 @@ systemd 服务 `ccs_webcam.service`）。
 - 内容检测在客户无状态栏/均匀画面上原理性失效（接缝行均亮度跳变
   仅 12.2 < 闸门 15；seam/taskbar 有假阳性实测 k=442/338）
 - 服务独占 /dev/video0，测裸采集前 `systemctl stop ccs_webcam`，测完拉起
+- **build.sh kernel 会静默吞掉 make 编译错误**（报 Error 后仍用旧
+  Image 重打包并打印 succeeded）——部署内核前必须核对
+  `arch/arm64/boot/Image` 时间戳或板上 `uname -v`
+- 服务 stop 后 GST 管线拆除要几十秒，期间 video0 REQBUFS 返回
+  EBUSY，属正常，等一会再测
 - 客户现场不接受任何人工对齐步骤，不接受依赖画面内容的方案
 
 ## 换机器后怎么开始工作
@@ -69,6 +75,6 @@ systemd 服务 `ccs_webcam.service`）。
 1. `git clone git@github.com:huangzhao98/rk3568.git`（本仓库）
 2. `git clone git@github.com:huangzhao98/rk3568-kernel.git`（内核完整源码）
 3. 完整 SDK（几十个 GB，repo 管理）不在 GitHub 上，需要的话从原开发机
-   拷贝或用 rockchip 官方渠道重新同步，然后把 kernel-patches/ 里 9 个
+   拷贝或用 rockchip 官方渠道重新同步，然后把 kernel-patches/ 里 10 个
    补丁 `git am` 到 SDK 的 kernel 目录
 4. 读 `README_开发流程.md`、`61_文件地图.md` 建立全局认识

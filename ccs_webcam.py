@@ -168,6 +168,16 @@ def has_signal(subdev):
     return query_dv(subdev)['w'] > 0
 
 
+def _relock_dirty():
+    """驱动标记：最近一次失锁期间 TMDS 是否一直在跑（脏重锁，相位摇骰）。
+    读不到（旧内核）按脏处理（安全侧）。"""
+    try:
+        return open('/sys/module/tc35874x/parameters/relock_dirty') \
+            .read().strip() == '1'
+    except OSError:
+        return True
+
+
 # ---------------- EDID ----------------
 
 # CEA-861 标准时序参数（pclk 单位 10kHz；hs?/vs? = 同步偏移/脉宽）
@@ -607,6 +617,10 @@ class Capture:
         self.state = "init"
         self.sig_ok = True         # 输入信号在位（看门狗 1.5s 轮询发布；网页
                                    # "无视频输入信号"提示用）
+        self.phase_suspect = False  # 流式期间信号掉过又恢复（看门狗置位）：
+                                   # 中途重锁相位是摇骰（2026-10-29 实测源侧
+                                   # 抖动 6~8s 后重锁，一次 0 一次非 0），
+                                   # 钉值 0 的快速通道一律禁用，走完整对齐
         self.half = False          # False=全分辨率清晰 / True=半分辨率流畅
         self.bright = 100          # 亮度增益 %（100=原始；VGA 模拟采样偏暗的补偿）
         self._blut = None          # 亮度 LUT，100 时为 None（零开销直通）
@@ -1674,12 +1688,15 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                 _adopt_detected_timings()   # 门控期间无时序可采，放行后补采
                 print("[align] 门控放行后信号到来：源从帧头出图，快速采信",
                       flush=True)
-            elif _pinned_roll(cap.w, cap.h) == 0:
+            elif _pinned_roll(cap.w, cap.h) == 0 and not cap.phase_suspect \
+                    and not _relock_dirty():
                 # 服务重启（门控早已放行、信号一直在）：驱动 1Hz tick 边界解
                 # 静音保证相位不变，钉值 0 直接可信，走门控同一快速采信——
                 # 实测热重启走 6s 测量窗在无特征画面上必落空，再搭 12s 重锁
                 # （20:52 实测全程 ~20s）；相位本来就没变，纯属浪费。仅钉值
-                # =0 可快进：非 0 说明上次源不理会 HPD，相位无 0 保证
+                # =0 可快进：非 0 说明上次源不理会 HPD，相位无 0 保证。
+                # relock_dirty 兜底：服务停止期间发生的脏重锁看门狗看不到，
+                # 驱动标记跨服务重启仍在（2026-10-29）
                 clean_start = True
                 print("[align] 热启动+钉值0：相位不变，快速采信", flush=True)
             _follow_source(cap, subdev)      # 源切了分辨率就跟过去（如强制 1080p）
@@ -1861,6 +1878,8 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
             print(f"[align] attempt{attempt + 1}: roll={k} conf={conf} via={m} "
                   f"ref={'y' if cap.ref else 'n'}", flush=True)
             cap.state = "streaming" if conf else "对齐未置信"
+            if conf:
+                cap.phase_suspect = False    # 相位已重新确认，解除快进禁令
             cap.align_done_ts = time.time()    # track 冷却起点（瞬态帧不可信）
             # 成功后清锁存再续 5s：恢复瞬态攒下的中断锁存会在此后 1~2 个
             # 轮询周期被驱动读到，触发 format_change 静音+重开流改变相位
@@ -1944,6 +1963,17 @@ def watchdog(cap):
             cap.last_frame_ts = now                # 对齐期不做挂死判定
         else:
             if ok and not was_ok:
+                # 信号掉过又回来 = 芯片中途重锁。相位是否可疑看驱动
+                # relock_dirty：失锁期间 TMDS 一直在跑（源没停输出）= 脏
+                # 重锁，源贴着飞行中的画面恢复，相位摇骰（2026-10-29 实测
+                # 一次 0 一次非 0），钉值不可信必须完整对齐；TMDS 掉过
+                # （拔线/源停输出）= 干净重锁，源从帧边界重新出图相位钉
+                # 0，可继续快进。读不到参数（旧内核）按可疑处理（安全侧）
+                dirty = _relock_dirty()
+                cap.phase_suspect = dirty
+                print(f"[watchdog] signal recovered, relock "
+                      f"{'DIRTY, phase suspect' if dirty else 'clean, phase pinned'}",
+                      flush=True)
                 cap.need_realign.set()             # 信号恢复 → 重对齐
             was_ok = ok
             idle = now - cap.last_frame_ts
@@ -2791,7 +2821,10 @@ def main():
                     # 应用旧钉值反而卷动）
                     forced = cap.realign_forced
                     cap.realign_forced = False
-                    kp = None if forced else _pinned_roll(cap.w, cap.h)
+                    # 信号掉过又恢复后的重对齐禁用快进：中途重锁相位是摇骰
+                    # （2026-10-29 实测），必须走完整测量链重新确认
+                    kp = None if (forced or cap.phase_suspect) \
+                        else _pinned_roll(cap.w, cap.h)
                     if kp == 0:
                         subdev = find_subdev()
                         geo0 = (cap.w, cap.h)

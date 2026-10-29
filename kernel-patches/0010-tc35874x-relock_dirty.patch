@@ -1,0 +1,88 @@
+From c4fa8443c8616b3eeaa5d9d936c311e113a929b1 Mon Sep 17 00:00:00 2001
+From: huangzhao <huangzhao@WIN-TLG0U98OLAE>
+Date: Thu, 29 Oct 2026 08:55:49 +0800
+Subject: [PATCH] =?UTF-8?q?tc35874x:=20relock=5Fdirty=20=E2=80=94=20?=
+ =?UTF-8?q?=E5=A4=B1=E9=94=81=E6=9C=9F=E9=97=B4TMDS=E4=BF=9D=E6=8C=81?=
+ =?UTF-8?q?=E6=A0=87=E8=AE=B0=E8=84=8F=E9=87=8D=E9=94=81=EF=BC=8C=E7=94=A8?=
+ =?UTF-8?q?=E6=88=B7=E6=80=81=E6=8D=AE=E6=AD=A4=E5=88=A4=E7=9B=B8=E4=BD=8D?=
+ =?UTF-8?q?=E5=8F=AF=E7=96=91?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ drivers/media/i2c/tc35874x.c | 30 +++++++++++++++++++++++++++++-
+ 1 file changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/media/i2c/tc35874x.c b/drivers/media/i2c/tc35874x.c
+index 794371349..01ae1814d 100644
+--- a/drivers/media/i2c/tc35874x.c
++++ b/drivers/media/i2c/tc35874x.c
+@@ -55,6 +55,17 @@ static int debug;
+ module_param(debug, int, 0644);
+ MODULE_PARM_DESC(debug, "debug level (0-3)");
+ 
++/* CCS: 最近一次失锁期间 TMDS 时钟是否一直在跑。源侧短暂抖动（SYNC 掉而
++ * TMDS 不停）后重锁，源是贴着飞行中的画面恢复输出，TX 重建帧相位随机
++ * （卷动）；TMDS 也掉过（拔线/源重启输出）则是从帧边界重新出图，延迟
++ * 解静音相位钉 0。用户态看门狗在信号恢复后读此参数决定相位是否可疑。
++ * 2026-10-29 实测：源侧 6~8s 抖动触发的两次中途重锁，一次相位 0 一次
++ * 非 0，此前用户态一律信任钉值 0 导致卷动永久挂屏。 */
++static int relock_dirty;
++module_param(relock_dirty, int, 0444);
++MODULE_PARM_DESC(relock_dirty,
++	"CCS: 1 if last relock happened with TMDS running (phase random)");
++
+ MODULE_DESCRIPTION("Toshiba TC35874X HDMI to CSI-2 bridge driver");
+ MODULE_AUTHOR("Ramakrishnan Muthukrishnan <ram@rkrishnan.org>");
+ MODULE_AUTHOR("Mikhail Khelik <mkhelik@cisco.com>");
+@@ -208,6 +219,9 @@ struct tc35874x_state {
+ 	struct delayed_work work_unmute;
+ 	unsigned long lock_since;	/* 连续锁定的起始时刻，0=未锁定 */
+ 	unsigned long nosync_since;	/* TMDS 在而 SYNC 丢失的起始时刻，0=正常 */
++	bool outage;			/* 处于失锁期（供 relock_dirty 首次采样） */
++	int relock_dirty;		/* 本次失锁期间 TMDS 是否一直在跑
++					 * （1=脏重锁，恢复后相位随机） */
+ 	unsigned int i2c_errs;		/* 连续 i2c 读失败计数（挂死自救用） */
+ 	bool stream_on;			/* 应用层已请求开流 */
+ 
+@@ -778,6 +792,17 @@ static void tc35874x_work_unmute(struct work_struct *work)
+ 	state->i2c_errs = 0;
+ 
+ 	if (!(sys & MASK_S_TMDS) || !(sys & MASK_S_SYNC)) {
++		/* 失锁期间 TMDS 一直在跑 = 源没停输出，恢复时贴着飞行中的
++		 * 画面继续，重锁相位随机（卷动）；TMDS 掉过 = 源停过输出，
++		 * 恢复从帧边界重新出图，相位钉 0。全程任一读数有 TMDS 即
++		 * 记脏，用户态在信号恢复后据此决定相位是否可疑 */
++		if (!state->outage) {
++			state->outage = true;
++			state->relock_dirty = !!(sys & MASK_S_TMDS);
++		} else if (sys & MASK_S_TMDS) {
++			state->relock_dirty = 1;
++		}
++		relock_dirty = state->relock_dirty;
+ 		if (!(i2c_rd8(sd, VI_MUTE) & MASK_VI_MUTE))
+ 			v4l2_info(sd, "ccs: sync lost, force mute\n");
+ 		i2c_wr8(sd, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
+@@ -800,6 +825,7 @@ static void tc35874x_work_unmute(struct work_struct *work)
+ 		return;
+ 	}
+ 	state->nosync_since = 0;
++	state->outage = false;
+ 	if (!state->lock_since)
+ 		state->lock_since = jiffies;
+ 	if (time_before(jiffies, state->lock_since + 1 * HZ)) {
+@@ -808,7 +834,9 @@ static void tc35874x_work_unmute(struct work_struct *work)
+ 	}
+ 	if (i2c_rd8(sd, VI_MUTE) & MASK_VI_MUTE) {
+ 		i2c_wr8(sd, VI_MUTE, MASK_AUTO_MUTE);
+-		v4l2_info(sd, "ccs: deferred unmute after stable lock\n");
++		v4l2_info(sd, "ccs: deferred unmute after stable lock (%s)\n",
++			  state->relock_dirty ?
++			  "relock DIRTY, phase random" : "clean relock, phase pinned");
+ 	}
+ 	schedule_delayed_work(&state->work_unmute, HZ);
+ }
+-- 
+2.43.0
+
