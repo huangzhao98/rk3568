@@ -62,15 +62,18 @@ systemd 服务 `ccs_webcam.service`）。
    PIL 回退 subsampling=1。编码器选择顺序 sw422→hw→pil
 6. **性能**：采集 60fps 满帧（实测），422 软编输出 ~60fps（双槽流水），
    信箱丢中间帧，不是采集问题
-7. **MS9332 EDID 自定义**（§28）：电脑看到的显示器名字/分辨率由板上
+7. **MS9332 EDID 自定义**（§28/§28b）：电脑看到的显示器名字/分辨率由板上
    MS9332 分配器的 EDID RAM（0x0d00 起 256B）决定，单片机 MS8005F
    上电写默认值。已破解其 I2C 协议（0x59，16 位地址[lo,hi]），RK3568
    用 i2c_sniff.ko（GPIO1_A0/A1 bit-bang，源码 ccs_dev/i2c_sniff.c）
    与单片机共享总线写 EDID；窗口开关 0x000c bit7（开=I2C 可写但 DDC
-   停供，关=DDC 正常，写完必须关窗再拔插一次）。部署：
-   `/usr/sbin/ccs_ms9332_edid.py`（写入+`--watch` 看门狗，被冲自愈）、
-   `ccs_edid.service`、`/etc/ccs_edid.bin`；网页 EDID 三个端点已同步
-   写 MS9332。冷启动端到端验证通过（电脑认 CCS-HDMI 720p60）
+   停供，关=DDC 正常，写完必须关窗）。部署：
+   `/usr/sbin/ccs_ms9332_edid.py`（写入+`--watch` 看门狗+NACK重试+
+   复核防误判）、`ccs_edid.service`、`/etc/ccs_edid.bin`（出厂=
+   720p60首选+1080p60可选双DTD，名字CCS-HDMI）；
+   **写完自动 TC358743 HPD 脉冲（0x8544 拉低2s）经 MS9332 传导让电脑
+   免拔线重读**；守卫：TMDS无且服务未起（开机门控期）才不脉冲。
+   冷启动端到端验证通过；4-lane 硬件下 1080p60 裸采集 ~56-60fps。
 
 ## 坑（不要再踩）
 
@@ -104,10 +107,15 @@ systemd 服务 `ccs_webcam.service`）。
   以 bit-bang 占用访问 MS9332，改回 okay 会与 bit-bang 冲突
 - **MS8005F 单片机不能离开 I2C 总线**：断开后 MS9332 上行口几分钟内
   彻底关 HPD，电脑认不到屏
+- 改 EDID 后 Windows 按 厂商+产品码+序列号 缓存，必须换序列号才能看到
+  变化；让电脑重读不用再物理拔线——写 TC358743 HPD_CTL(0x8544) 拉低 2s
+  再拉高即可（经 MS9332 传导，§28b），但**开机门控期（ccs_webcam 未
+  active）绝不可碰 HPD**
 - MS9332 的 0x000c bit7 窗口开着时电脑读不到 EDID——任何 EDID 操作
   结局必须关窗（写 0x00），脚本已保证，手工调寄存器时注意
-- 改 EDID 后 Windows 按 厂商+产品码+序列号 缓存，必须换序列号+拔插
-  一次才能看到新名字（HPD 软件重触发没找到，§28）
+- bit-bang 访问 MS9332 会偶发与 MS8005F 轮询撞车（NACK）——事务级
+  重试 5×50ms 兜底；看门狗抽查不匹配必须复核再重写，否则撞车污染的
+  读值会造成假"被冲"连环重写（§28b 事故）
 
 ## 换机器后怎么开始工作
 

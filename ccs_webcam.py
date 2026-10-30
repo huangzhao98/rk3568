@@ -353,6 +353,23 @@ def set_edid_hex(subdev, hextext, fix=True):
     return (True, 'EDID 已生效') if ok else (False, '读回内容不一致（校验和错误？可勾选自动修复）')
 
 
+def ms9332_apply(data):
+    """把同一份 EDID 同步进 MS9332 分配器（电脑/上游实际读的是它），并落盘
+    /etc/ccs_edid.bin 供开机服务自动重写（单片机每次上电会恢复默认 EDID）。
+    返回追加到页面消息的提示语。"""
+    try:
+        with open('/etc/ccs_edid.bin', 'wb') as f:
+            f.write(data)
+        r = subprocess.run(['/usr/sbin/ccs_ms9332_edid.py', '/etc/ccs_edid.bin'],
+                           capture_output=True, text=True, errors='replace',
+                           timeout=120)
+        if r.returncode == 0:
+            return '；电脑侧(分配器)已同步并模拟热插拔，电脑数秒内自动重新识别（无需拔线）'
+        return '；电脑侧(分配器)写入失败: ' + (r.stdout + r.stderr).strip()[-120:]
+    except Exception as e:
+        return '；电脑侧(分配器)写入异常: %s' % e
+
+
 # ---------------- 网络（systemd-networkd） ----------------
 
 def net_ifaces():
@@ -2634,8 +2651,10 @@ def page_edid(subdev, msg_html):
             f"周 <input name=week value=1 size=2> "
             f"屏幕尺寸 <input name=hcm value=16 size=2> × <input name=vcm value=9 size=2> cm "
             f"<button>生成并应用</button></form>"
-            f"<div class=warn>注意：1080p60 需 4-lane MIPI，当前 EVB 为 2-lane 仅支持 720p60/1080p30；"
-            f"设了带不动的主信号会采不到帧，恢复出厂 EDID 即可。</div>"
+            f"<div class=warn>注意：本板为 4-lane MIPI，720p60/1080p60 均可采集"
+            f"（1080p60 源网页预览约 40fps，720p60 源满 60fps）；"
+            f"改默认分辨率会让源重新协商，画面中断约几秒到一分钟属正常，"
+            f"改乱了点\"恢复出厂 720p EDID\"即可。</div>"
             f"<details><summary>高级：直接编辑 HEX</summary>"
             f"<form method=post action=/edid_apply>"
             f"<textarea name=edid>{esc(cur)}</textarea>"
@@ -2644,7 +2663,9 @@ def page_edid(subdev, msg_html):
             f"<form method=post action=/edid_preset style=display:inline>"
             f"<button name=preset value=720p>恢复出厂 720p EDID (CCS-HDMI)</button></form></details>"
             f"<div class=warn>应用后源端会重新协商输出，采集自动重对齐，画面中断几秒属正常。"
-            f"EDID 存在芯片 RAM，板子断电即丢（开机由 ccs_init.sh 重写）。</div>")
+            f"EDID 会同时写入采集芯片和 HDMI 分配器(MS9332，电脑实际读的是它)，"
+            f"并落盘 /etc/ccs_edid.bin，开机由 ccs_edid.service 自动重写；"
+            f"写入后自动模拟热插拔，电脑数秒内重新读取显示新名字（无需拔线）。</div>")
 
 
 def page_sys(subdev):
@@ -2985,6 +3006,10 @@ def main():
             if self.path == '/edid_apply':
                 ok, m = set_edid_hex(sd(), form.get('edid', ''), fix='fix' in form)
                 if ok:
+                    try:
+                        m += ms9332_apply(bytes(int(x, 16) for x in form.get('edid', '').split()))
+                    except ValueError:
+                        pass
                     cap.need_realign.set()
                     self._redirect(msg=m + '，已触发重对齐')
                 else:
@@ -3003,14 +3028,20 @@ def main():
                 ok, m = set_edid_hex(sd(), edid_to_hextext(data), fix=False)
                 if ok:
                     cap.need_realign.set()
-                    self._redirect(msg=f"EDID 已生成并生效（{form.get('name')} / {form.get('timing')}），重对齐中")
+                    self._redirect(msg=f"EDID 已生成并生效（{form.get('name')} / {form.get('timing')}），重对齐中" + ms9332_apply(data))
                 else:
                     self._redirect(err=m)
             elif self.path == '/edid_preset':
                 if form.get('preset') == '720p' and sd():
                     sh(f"v4l2-ctl -d {sd()} --set-edid file={EDID_GOOD},format=hex")
+                    try:
+                        with open(EDID_GOOD) as f:
+                            pdata = bytes(int(x, 16) for x in f.read().split())
+                        m2 = ms9332_apply(pdata)
+                    except (ValueError, OSError):
+                        m2 = ''
                     cap.need_realign.set()
-                    self._redirect(msg='已恢复 720p EDID，重对齐中')
+                    self._redirect(msg='已恢复 720p EDID，重对齐中' + m2)
                 else:
                     self._redirect(err='未知预设')
             elif self.path == '/net_apply':
