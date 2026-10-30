@@ -108,6 +108,13 @@ systemd 服务 `ccs_webcam.service`）。
 - **MS8005F 单片机不能离开 I2C 总线**：断开后 MS9332 上行口几分钟内
   彻底关 HPD，电脑认不到屏
 - 改 EDID 后 Windows 按 厂商+产品码+序列号 缓存，必须换序列号才能看到
+- **挂死复位禁止 unbind/bind**（§28c 实捕）：旧 ccs_chip_reset.sh 的
+  unbind/bind 会让 rkcif pipeline subdevs[] 缓存野指针，streamoff
+  OOPS 在持 stream_lock 上下文 → 锁泄漏 → open() 永久 D 态只能重启
+  整机。硬复位一律走 `echo 1 > /sys/bus/i2c/devices/4-000f/self_reset`
+- **对齐卡死有 align_supervisor 兜底**（170s 自杀自愈）；再遇到先
+  `kill -USR1 $(pgrep -f "ccs_webcam.py --port")` 让 faulthandler 喷
+  全线程栈到 journal 取证，别直接重启
   变化；让电脑重读不用再物理拔线——写 TC358743 HPD_CTL(0x8544) 拉低 2s
   再拉高即可（经 MS9332 传导，§28b），但**开机门控期（ccs_webcam 未
   active）绝不可碰 HPD**

@@ -26,6 +26,7 @@
 #    消卷/对齐/亮度/锐化/编码链两种管线共用，gst 缺失仅禁用该选项。
 
 import os, re, sys, fcntl, json, mmap, select, socket, struct, ctypes, termios, threading, time, argparse, subprocess, secrets, queue
+import signal, faulthandler
 import multiprocessing
 import urllib.parse
 import numpy as np
@@ -2006,6 +2007,29 @@ def _switch_backend(cap):
     cap.need_realign.set()
 
 
+def align_supervisor(cap):
+    """对齐卡死兜底（2026-10-30 两次实测"永远对齐中"）：align 内部的 150s
+    截止只在 attempt 边界检查，线程若死在 attempt 内部（疑似 gst C 层
+    try_pull_sample 阻塞，全线程 syscall 均正常等待、无 D 态）永不触发，
+    而 in_align 又屏蔽了挂死看门狗 → 无人兜底。本线程独立盯 state：
+    aligning/init 持续 >170s（>内部 150s 截止，正常对齐不可能到这）直接
+    自杀，systemd Restart=always 拉起全新进程走干净恢复（~15s）。
+    调试：kill -USR1 <pid> 可经 faulthandler 喷全线程栈到 journal。"""
+    since = None
+    while True:
+        time.sleep(10)
+        st = cap.state or ''
+        if st.startswith('aligning') or st == 'init':
+            if since is None:
+                since = time.time()
+            elif time.time() - since > 170:
+                print(f"[supervisor] 对齐卡死 {time.time() - since:.0f}s "
+                      f"(state={st})，自杀由 systemd 拉起恢复", flush=True)
+                os._exit(70)
+        else:
+            since = None
+
+
 def watchdog(cap):
     """监测信号：掉过再恢复（休眠/拔插）会破坏 DMA 相位，需重走对齐序列。
     对齐期间（in_align）的信号波动是序列自己造成的，只更新基线不触发。
@@ -2065,14 +2089,24 @@ def watchdog(cap):
                 last_reset = now                   # 冷却 60s：复位后重探测/重对齐
                 print(f"[watchdog] chip wedged? idle={idle:.0f}s qd={qd:.1f}s "  # 期间别再触发
                       f"-> hard reset", flush=True)
-                # ★ 必须先停流再 unbind：实测流式采集中直接 unbind tc35874x
-                # 驱动会让 rkcif/dphy 野指针内核崩溃（recursive fault 只能重启）。
-                # 芯片挂死时 stream_off 的 i2c 写会逐个超时，最坏几秒，可接受
-                try:
-                    cap.stream_off()
-                except Exception as e:
-                    print(f"[watchdog] stream_off before reset: {e!r}", flush=True)
-                sh('sh /usr/sbin/ccs_chip_reset.sh')
+                # ★ 首选驱动内自救复位（sysfs，不 unbind）：media 链路/rkcif
+                # 流/用户态 fd 全部保持，复位后帧自然回来。旧 unbind/bind 路
+                # 会让 rkcif pipeline 缓存的 subdev 指针变野，下次 streamoff
+                # 解引用野指针 OOPS 在持 stream_lock 上下文 → 锁泄漏 → 之后
+                # open() 永久 D 态卡死只能整机重启（2026-10-30 实捕）。
+                # 仅旧内核（无 sysfs 节点）或非 tc35874x 通道时回退脚本
+                if subdev and os.path.exists('/sys/bus/i2c/devices/4-000f/self_reset'):
+                    sh('echo 1 > /sys/bus/i2c/devices/4-000f/self_reset')
+                else:
+                    # ★ 必须先停流再 unbind：实测流式采集中直接 unbind
+                    # tc35874x 驱动会让 rkcif/dphy 野指针内核崩溃。
+                    # 芯片挂死时 stream_off 的 i2c 写逐个超时，最坏几秒
+                    try:
+                        cap.stream_off()
+                    except Exception as e:
+                        print(f"[watchdog] stream_off before reset: {e!r}",
+                              flush=True)
+                    sh('sh /usr/sbin/ccs_chip_reset.sh')
                 cap.last_frame_ts = time.time()
                 subdev = find_subdev()             # 复位重探测后节点可能变
                 cap.need_realign.set()
@@ -2793,7 +2827,9 @@ def main():
     _load_ref(cap)                              # 上次对齐的参考帧：无任务栏场景自举用
     _load_roll(cap)                             # 上次确认的相位：对齐测量失败时的回退值
     threading.Thread(target=watchdog, args=(cap,), daemon=True).start()
+    threading.Thread(target=align_supervisor, args=(cap,), daemon=True).start()
     threading.Thread(target=usb_heal, daemon=True).start()
+    faulthandler.register(signal.SIGUSR1)   # kill -USR1 喷全线程栈到 journal
 
     _TIMING = bool(os.environ.get('CCS_TIMING'))
 
