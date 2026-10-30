@@ -211,6 +211,35 @@ EDID_TIMINGS = {
 EDID_CHROM = bytes([0xcb, 0x46, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54])
 
 
+def cvt_rb(w, h, refresh):
+    """CVT-RB（减空白）时序生成，整数算法移植自内核 drm_cvt_mode
+    （reduced 分支）。验证：1920x1080@60 → 138.50MHz/2080x1111 与 cvt 一致。
+    返回与 EDID_TIMINGS 同构的 timing dict（pclk 单位 10kHz）。
+    CVT-RB 同步极性固定为 +hsync/-vsync（pol=0x1a）。"""
+    w -= w % 8                                  # CVT 水平粒度 8 像素
+    # vsync 宽度按宽高比（CVT 规定）
+    if h % 3 == 0 and h * 4 // 3 == w:
+        vsync = 4                               # 4:3
+    elif h % 9 == 0 and h * 16 // 9 == w:
+        vsync = 5                               # 16:9
+    elif h % 10 == 0 and h * 16 // 10 == w:
+        vsync = 6                               # 16:10
+    elif h % 4 == 0 and h * 5 // 4 == w:
+        vsync = 7                               # 5:4
+    elif h % 9 == 0 and h * 15 // 9 == w:
+        vsync = 7                               # 15:9
+    else:
+        vsync = 10                              # 自定义比例
+    hperiod = (10**9 - 460 * 1000 * refresh) // (h * refresh)  # ns×1000
+    vbilines = 460 * 1000 // hperiod + 1
+    if vbilines < 3 + vsync + 6:                # 前肩+同步+后肩最小值
+        vbilines = 3 + vsync + 6
+    pclk_khz = (w + 160) * 1000000 // hperiod
+    pclk_khz -= pclk_khz % 250                  # 250kHz 步进向下取整
+    return dict(pclk=pclk_khz // 10, ha=w, hb=160, hso=48, hsp=32,
+                va=h, vb=vbilines, vso=3, vp=vsync, pol=0x1a)
+
+
 def _dtd(t, hmm, vmm):
     """18 字节详细时序描述符（数字分离同步，+hsync +vsync，与出厂 EDID 一致）"""
     b = bytearray(18)
@@ -224,13 +253,29 @@ def _dtd(t, hmm, vmm):
     b[11] = ((t['hso'] >> 8) << 6) | ((t['hsp'] >> 8) << 4) | ((t['vso'] >> 4) << 2) | (t['vp'] >> 4)
     b[12], b[13] = hmm & 0xff, vmm & 0xff
     b[14] = ((hmm >> 8) << 4) | (vmm >> 8)
-    b[17] = 0x1e
+    b[17] = t.get('pol', 0x1e)
     return b
 
 
-def build_edid(name, timing, mfr, product, serial, year, week, hcm, vcm):
-    """明文字段 → 128 字节 EDID（含校验和）。返回 bytes 或抛 ValueError"""
-    if timing not in EDID_TIMINGS:
+def build_edid(name, timing, mfr, product, serial, year, week, hcm, vcm,
+               custom=None):
+    """明文字段 → 128 字节 EDID（含校验和）。返回 bytes 或抛 ValueError。
+    timing='custom' 时 custom=(宽,高,刷新率) 经 CVT-RB 计算时序"""
+    if timing == 'custom':
+        try:
+            cw, ch, cr = custom
+        except (TypeError, ValueError):
+            raise ValueError('自定义分辨率参数缺失')
+        if not (640 <= cw <= 1920 and 400 <= ch <= 1080 and 24 <= cr <= 75):
+            raise ValueError('自定义范围：宽640-1920 高400-1080 刷新率24-75')
+        ch &= ~1  # YUV422 采集要求偶数行高，奇数自动向下取偶
+        t = cvt_rb(cw, ch, cr)
+        if t['pclk'] > 16000:
+            raise ValueError(f'像素时钟 {t["pclk"] / 100:.1f}MHz 超限'
+                             f'（TC358743 上限 165MHz），降低刷新率或分辨率')
+    elif timing in EDID_TIMINGS:
+        t = EDID_TIMINGS[timing]
+    else:
         raise ValueError('未知分辨率预设')
     name = name.strip()[:13]
     if not name or not all(32 <= ord(c) < 127 for c in name):
@@ -259,7 +304,7 @@ def build_edid(name, timing, mfr, product, serial, year, week, hcm, vcm):
     ed[25:35] = EDID_CHROM
     for i in range(38, 54):                   # 标准时序：无
         ed[i] = 0x01
-    ed[54:72] = _dtd(EDID_TIMINGS[timing], hcm * 10, vcm * 10)
+    ed[54:72] = _dtd(t, hcm * 10, vcm * 10)
     ed[72:77] = bytes([0, 0, 0, 0xFC, 0])     # 监视器名描述符
     nb = name.encode('ascii')
     ed[77:77 + len(nb)] = nb
@@ -2022,17 +2067,20 @@ def align_supervisor(cap):
     attempt 计数（aligning#1→#2）会改字符串，但 gst 管线静默卡死时
     attempt 永远测不到帧、对齐永不置信，空转多久都不算恢复（第三次
     实捕 2026-10-30 晚：state 在 aligning#1/#2 间翻转而卡死依旧）。
+    计时必须用单调钟：板子无 RTC，开机时钟停在旧时刻，NTP 校时一跳
+    就是几分钟，time.time() 会把跳变算成"卡死时长"误杀（2026-10-30
+    实测：开机即报"对齐卡死 617s"自杀）。
     调试：kill -USR1 <pid> 可经 faulthandler 喷全线程栈到 journal。"""
-    last_ok = time.time()
+    last_ok = time.monotonic()
     while True:
         time.sleep(10)
         st = cap.state or ''
         if not (st.startswith('aligning') or st == 'init') or \
                 getattr(cap, 'align_conf', False):
-            last_ok = time.time()          # 不在对齐，或对齐已置信 = 健康
+            last_ok = time.monotonic()     # 不在对齐，或对齐已置信 = 健康
             continue
-        if time.time() - last_ok > 170:
-            print(f"[supervisor] 对齐卡死 {time.time() - last_ok:.0f}s "
+        if time.monotonic() - last_ok > 170:
+            print(f"[supervisor] 对齐卡死 {time.monotonic() - last_ok:.0f}s "
                   f"(state={st})，自杀由 systemd 拉起恢复", flush=True)
             os._exit(70)
 
@@ -2101,6 +2149,33 @@ def watchdog(cap):
                         (getattr(cap, 'gst_dead', 0.0) > last_rebuild)
             if pipe_dead and not chip_wedged:
                 if last_rebuild and now - last_rebuild < 90:
+                    # 重建无效，按 rkcif 中断是否静止分流：
+                    # 中断静止 = TX↔rkcif 链路级卡死（芯片锁定未静音、SYS=0x8f
+                    # 但 rkcif 计数停走），重建/重启服务都救不回，唯芯片自救
+                    # 复位可解（2026-10-30 800x500@CVT-RB 实测）；中断照跑才是
+                    # gst 静默卡死（§28d），重启服务恢复
+                    def _cif_irq():
+                        try:
+                            with open('/proc/interrupts') as _f:
+                                for _ln in _f:
+                                    if 'rkcif' in _ln:
+                                        return int(_ln.split()[1])
+                        except Exception:
+                            pass
+                        return -1
+                    _i0, _i1 = _cif_irq(), None
+                    time.sleep(1)
+                    _i1 = _cif_irq()
+                    if 0 <= _i0 == _i1 and \
+                            os.path.exists('/sys/bus/i2c/devices/4-000f/self_reset') and \
+                            (not last_reset or now - last_reset > 60):
+                        last_reset = now
+                        print("[watchdog] rebuild didn't help, rkcif irq silent "
+                              "-> chip self reset", flush=True)
+                        sh('echo 1 > /sys/bus/i2c/devices/4-000f/self_reset')
+                        cap.last_frame_ts = time.time()
+                        cap.need_realign.set()
+                        continue
                     print("[watchdog] pipeline rebuild didn't help -> "
                           "self-restart via systemd", flush=True)
                     os._exit(1)
@@ -2705,6 +2780,7 @@ def page_edid(subdev, msg_html):
     dec = edid_decode(cur)
     opts = ''.join(f'<option{" selected" if k == "720p60" else ""}>{k}</option>'
                    for k in EDID_TIMINGS)
+    opts += '<option value=custom>自定义…</option>'
     return (f"当前：<b>{esc(dec.get('name') or '(无名)')}</b>"
             f"　厂商 {esc(dec.get('mfr', '?'))}　{esc(dec.get('timing', '无详细时序'))}"
             f"　芯片节点：{esc(subdev) or '未找到'}{msg_html}"
@@ -2712,9 +2788,12 @@ def page_edid(subdev, msg_html):
             f"<form method=post action=/edid_build>"
             f"监视器名称 <input name=name value='{esc(dec.get('name') or 'CCS-HDMI')}' size=12 maxlength=13> "
             f"分辨率 <select name=timing>{opts}</select> "
+            f"自定义 <input name=cw size=4 placeholder=宽>×<input name=ch size=4 placeholder=高>"
+            f"@<input name=cr size=2 placeholder=60>Hz "
+            f"<span class=dim>(选\"自定义\"时生效，如 800×500@60；时序按 CVT-RB 标准自动算，高为奇数自动减 1)</span><br>"
             f"厂商ID <input name=mfr value='{esc(dec.get('mfr') or 'CCS')}' size=3 maxlength=3> "
             f"产品码 <input name=product value=0001 size=4> "
-            f"序列号 <input name=serial value=1 size=6><br>"
+            f"序列号 <input name=serial value=1 size=6> "
             f"生产年份 <input name=year value=2026 size=4> "
             f"周 <input name=week value=1 size=2> "
             f"屏幕尺寸 <input name=hcm value=16 size=2> × <input name=vcm value=9 size=2> cm "
@@ -3091,14 +3170,20 @@ def main():
                         form.get('mfr', ''), int(form.get('product', '0'), 16),
                         int(form.get('serial', '0')), int(form.get('year', '0')),
                         int(form.get('week', '0')), int(form.get('hcm', '0')),
-                        int(form.get('vcm', '0')))
+                        int(form.get('vcm', '0')),
+                        custom=(int(form.get('cw', '0')),
+                                int(form.get('ch', '0')),
+                                int(form.get('cr', '0'))))
                 except (ValueError, KeyError) as e:
                     self._redirect(err=f'参数错误: {e}')
                     return
                 ok, m = set_edid_hex(sd(), edid_to_hextext(data), fix=False)
                 if ok:
+                    tname = form.get('timing')
+                    if tname == 'custom':
+                        tname = f"{form.get('cw')}x{form.get('ch')}@{form.get('cr')}"
                     cap.need_realign.set()
-                    self._redirect(msg=f"EDID 已生成并生效（{form.get('name')} / {form.get('timing')}），重对齐中" + ms9332_apply(data))
+                    self._redirect(msg=f"EDID 已生成并生效（{form.get('name')} / {tname}），重对齐中" + ms9332_apply(data))
                 else:
                     self._redirect(err=m)
             elif self.path == '/edid_preset':
