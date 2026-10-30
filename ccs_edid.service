@@ -1,0 +1,12 @@
+[Unit]
+Description=CCS MS9332 EDID apply + watchdog (custom EDID to HDMI splitter)
+ConditionPathExists=/etc/ccs_edid.bin
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/ccs_ms9332_edid.py --watch
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -72,7 +72,7 @@
 &gpio2 {
 	gpio-line-names =
 		/* A0~A7 */ "SDMMC0_D3", "SDMMC0_CMD", "SDMMC0_CLK", "GMAC0_RXD2", "GMAC0_RXD3", "GMAC0_RXCLK", "GMAC0_TXD2", "GMAC0_TXD3",
-		/* B0~B7 */ "GMAC0_TXCLK", "LED_GREEN_STATE", "LED_YELLOW_STATE", "GMAC0_TXD0", "GMAC0_TXD1", "GMAC0_TXEN", "GMAC0_RXD0", "GMAC0_RXD1",
+		/* B0~B7 */ "GMAC0_TXCLK", "LED_YELLOW_STATE", "LED_GREEN_STATE", "GMAC0_TXD0", "GMAC0_TXD1", "GMAC0_TXEN", "GMAC0_RXD0", "GMAC0_RXD1",
 		/* C0~C7 */ "GMAC0_RXDV_CRS", "ETH0_REFCLKO_25M", "GMAC0_MCLKINOUT", "GMAC0_MDC", "GMAC0_MDIO", "LED_BLUE_STATE", "LED_RED_STATE", "",
 		/* D0~D7 */ "GMAC1_INT", "GMAC1_RSTn", "GMAC0_INT", "GMAC0_RSTn", "PCIE30X2_CLKREQn", "PCIE30X2_WAKEn", "PCIE30X2_PERSTn", "PCIE30X2_PRSNT";
 };
@@ -114,8 +114,12 @@
 };
 
 /* i2c3 (GPIO1_A0/A1)：MS9288C + MS9332/MS8005F */
+/* [正式形态] i2c3 保持 disabled：引脚 GPIO1_A0(SDA)/GPIO1_A1(SCL) 已由
+ * ccs_dev/i2c_sniff.c 内核模块以 GPIO bit-bang 方式占用，用于与 MS8005F
+ * 单片机共享总线访问 MS9332（写 EDID RAM / 嗅探抓包）。
+ * 切勿改回 okay——内核 i2c3 控制器与 bit-bang 同时驱动会冲突。 */
 &i2c3 {
-	status = "okay";
+	status = "disabled";
 	pinctrl-names = "default";
 	pinctrl-0 = <&i2c3m0_xfer>;
 
@@ -392,10 +396,26 @@
 	pinctrl-0 = <&uart4m1_xfer>;
 };
 
-/* uart8：禁止使能！四脚当 GPIO 经 U29(TXS0104) 驱动 LED 状态：
- * GPIO2_C5(TX)→LED17 蓝，GPIO2_B1(RTSn)→LED16 绿，
- * GPIO2_B2(CTSn)→LED15 黄，GPIO2_C6(RX)→LED14 红。
+/* uart8：禁止使能！四脚经 U29(TXS0104) 接 LED_x_STATE 网络——外部 5V
+ * 信号直接驱动 LED，同时降到 1.8V 给 SoC 做状态检测输入（只读，高阻）：
+ * GPIO2_C5(TX)→LED_BLUE 蓝，GPIO2_B2(CTSn)→LED_GREEN 绿，
+ * GPIO2_B1(RTSn)→LED_YELLOW 黄，GPIO2_C6(RX)→LED_RED 红。
  * 默认复位态即 gpio 功能，不引用 uart8m0 组即可 */
+
+/* 基板 dtsi 把 uart8 使能了（BT HCI 用），且 pinctrl 把 C5/C6/B2 复用成
+ * 串口功能——与本板"四脚当外部信号检测输入"冲突，按 IO 总表强制禁用 */
+&uart8 {
+	status = "disabled";
+};
+
+/* wireless_bluetooth 的 uart_rts_gpios 占着 GPIO2_B1（uart8 RTS），
+ * uart8 已禁，RTS 无意义，删掉让位给外部信号检测输入 */
+&wireless_bluetooth {
+	/delete-property/ uart_rts_gpios;
+	/delete-property/ pinctrl-names;
+	/delete-property/ pinctrl-0;
+	/delete-property/ pinctrl-1;
+};
 
 /* uart9：禁止使能！GPIO4_C6 为电源开关检测输入（R27 5.9k+D12），
  * GPIO4_C5(TX) 载板未接 */
