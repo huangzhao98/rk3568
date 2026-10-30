@@ -1,0 +1,169 @@
+From 2febbea6e2bc542572408e7c80dcb922233868d3 Mon Sep 17 00:00:00 2001
+From: huangzhao <huangzhao@WIN-TLG0U98OLAE>
+Date: Fri, 30 Oct 2026 17:34:37 +0800
+Subject: [PATCH] =?UTF-8?q?=C2=A728c+e:=20tc35874x=20self=5Freset=20sysfs?=
+ =?UTF-8?q?=20+=20rkcif=E9=87=8E=E6=8C=87=E9=92=88=E9=98=B2=E6=8A=A4=20+?=
+ =?UTF-8?q?=20rkcif=E5=B8=A7=E9=AB=98=E5=BA=A6=E6=AD=A5=E9=95=BF=E6=94=BE?=
+ =?UTF-8?q?=E5=AE=BD=E5=88=B02?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- tc35874x: /sys/bus/i2c/devices/4-000f/self_reset 用户态自救复位入口，
+  替代 unbind/bind（后者致 rkcif pipeline subdevs[] 野指针 OOPS 锁泄漏）
+- rkcif dev.c: rkcif_pipe_sd_stale() 跳过 NULL/0xdead4ead subdev
+- rkcif capture.c: step_height 8->2，修复 gst v4l2src 对 CVT-RB 自定义
+  分辨率（如800x500，500%8!=0）协商 not-negotiated 无帧
+- dtsi: i2c3 正式禁用（引脚归 i2c_sniff bit-bang 模块访问 MS9332）
+---
+ .../boot/dts/rockchip/rk3568-atk-ccs.dtsi     |  6 ++++-
+ drivers/media/i2c/tc35874x.c                  | 27 +++++++++++++++++++
+ drivers/media/platform/rockchip/cif/capture.c |  7 ++++-
+ drivers/media/platform/rockchip/cif/dev.c     | 22 +++++++++++++++
+ 4 files changed, 60 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/rockchip/rk3568-atk-ccs.dtsi b/arch/arm64/boot/dts/rockchip/rk3568-atk-ccs.dtsi
+index b933d700c..dc07b8afb 100644
+--- a/arch/arm64/boot/dts/rockchip/rk3568-atk-ccs.dtsi
++++ b/arch/arm64/boot/dts/rockchip/rk3568-atk-ccs.dtsi
+@@ -114,8 +114,12 @@
+ };
+ 
+ /* i2c3 (GPIO1_A0/A1)：MS9288C + MS9332/MS8005F */
++/* [正式形态] i2c3 保持 disabled：引脚 GPIO1_A0(SDA)/GPIO1_A1(SCL) 已由
++ * ccs_dev/i2c_sniff.c 内核模块以 GPIO bit-bang 方式占用，用于与 MS8005F
++ * 单片机共享总线访问 MS9332（写 EDID RAM / 嗅探抓包）。
++ * 切勿改回 okay——内核 i2c3 控制器与 bit-bang 同时驱动会冲突。 */
+ &i2c3 {
+-	status = "okay";
++	status = "disabled";
+ 	pinctrl-names = "default";
+ 	pinctrl-0 = <&i2c3m0_xfer>;
+ 
+diff --git a/drivers/media/i2c/tc35874x.c b/drivers/media/i2c/tc35874x.c
+index d222b877d..6a1856f21 100644
+--- a/drivers/media/i2c/tc35874x.c
++++ b/drivers/media/i2c/tc35874x.c
+@@ -764,6 +764,28 @@ static void tc35874x_self_reset(struct tc35874x_state *state)
+ 	state->i2c_errs = 0;
+ }
+ 
++/* CCS 用户态自救复位入口：echo 1 > /sys/bus/i2c/devices/4-000f/self_reset
++ * 由 ccs_webcam 挂死看门狗触发，与驱动内自救同路（不 unbind，media 链路/
++ * rkcif 流/用户态 fd 全部保持）。替代旧的 unbind/bind 硬复位脚本——后者
++ * 会让 rkcif pipeline 缓存的 subdev 指针变野，streamoff 解引用 OOPS 在
++ * 持 stream_lock 上下文 → 锁泄漏 → 之后 open() 永久 D 态卡死，只能整机
++ * 重启（2026-10-30 实捕，见 50_内核定制修改存档.md §28c） */
++static ssize_t self_reset_store(struct device *dev,
++				struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	struct v4l2_subdev *sd = i2c_get_clientdata(to_i2c_client(dev));
++	struct tc35874x_state *state = to_state(sd);
++
++	/* 与常驻 work_unmute 互斥：它也在跑时可能并发读写寄存器 */
++	cancel_delayed_work_sync(&state->work_unmute);
++	tc35874x_self_reset(state);
++	if (state->stream_on)
++		schedule_delayed_work(&state->work_unmute, HZ);
++	return count;
++}
++static DEVICE_ATTR_WO(self_reset);
++
+ /* CCS 延迟解静音监控（自续轮询，开流期间常驻）：
+  * VI_MUTE 解静音瞬间 CSI TX 会以当时的输入同步位置重建帧结构，
+  * 若恰逢锁定瞬态的垃圾同步，相位就是随机的（画面垂直卷动的根源）。
+@@ -2739,6 +2761,10 @@ static int tc35874x_probe(struct i2c_client *client,
+ 	v4l2_info(sd, "%s found @ 0x%x (%s)\n", client->name,
+ 		  client->addr << 1, client->adapter->name);
+ 
++	/* CCS 用户态自救复位入口（见 self_reset_store 注释） */
++	if (device_create_file(&client->dev, &dev_attr_self_reset))
++		v4l2_warn(sd, "ccs: self_reset sysfs create failed\n");
++
+ 	return 0;
+ 
+ err_work_queues:
+@@ -2759,6 +2785,7 @@ static int tc35874x_remove(struct i2c_client *client)
+ 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
+ 	struct tc35874x_state *state = to_state(sd);
+ 
++	device_remove_file(&client->dev, &dev_attr_self_reset);
+ 	if (!state->i2c_client->irq) {
+ 		del_timer_sync(&state->timer);
+ 		flush_work(&state->work_i2c_poll);
+diff --git a/drivers/media/platform/rockchip/cif/capture.c b/drivers/media/platform/rockchip/cif/capture.c
+index 5a4c1376a..cb1caae62 100644
+--- a/drivers/media/platform/rockchip/cif/capture.c
++++ b/drivers/media/platform/rockchip/cif/capture.c
+@@ -30,6 +30,11 @@
+ #define CIF_MAX_HEIGHT		8192
+ 
+ #define OUTPUT_STEP_WISE	8
++/* 高度步长单独放宽到 2：gst v4l2src 协商要求 (max-min)%step==0，
++ * 自定义 CVT-RB 分辨率（如 800x500，500%8!=0）会导致 caps 断言
++ * gst_value_set_int_range_step 失败、整条链路 not-negotiated 无帧。
++ * 高度只是行数，无 DMA 对齐要求；YUV422/420 只需偶数行。 */
++#define OUTPUT_STEP_WISE_H	2
+ 
+ #define RKCIF_PLANE_Y		0
+ #define RKCIF_PLANE_CBCR	1
+@@ -3600,7 +3605,7 @@ static int rkcif_enum_framesizes(struct file *file, void *prov,
+ 	s->max_width = input_rect.width;
+ 	s->max_height = input_rect.height;
+ 	s->step_width = OUTPUT_STEP_WISE;
+-	s->step_height = OUTPUT_STEP_WISE;
++	s->step_height = OUTPUT_STEP_WISE_H;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/media/platform/rockchip/cif/dev.c b/drivers/media/platform/rockchip/cif/dev.c
+index eb7ca419e..acbfc89ce 100644
+--- a/drivers/media/platform/rockchip/cif/dev.c
++++ b/drivers/media/platform/rockchip/cif/dev.c
+@@ -484,6 +484,16 @@ static int rkcif_pipeline_close(struct rkcif_pipeline *p)
+  * stream-on order: isp_subdev, mipi dphy, sensor
+  * stream-off order: mipi dphy, sensor, isp_subdev
+  */
++/* CCS: unbind/bind 传感器后 p->subdevs[] 里可能残留已释放的 subdev 指针
++ * （2026-10-30 实测：streamoff 解引用野指针 OOPS 在持 stream_lock 的上下
++ * 文 → 锁泄漏 → 之后 open() 永久 D 态卡死，只能整机重启）。已释放内存被
++ * 复用后指针槽常见特征：高 32 位是 spinlock 魔数 0xdead4ead。合法内核
++ * 指针高 32 位为 0xffffffc0/0xffffff80 等，毒值可安全区分 */
++static bool rkcif_pipe_sd_stale(struct v4l2_subdev *sd)
++{
++	return !sd || (u32)((unsigned long)sd >> 32) == 0xdead4ead;
++}
++
+ static int rkcif_pipeline_set_stream(struct rkcif_pipeline *p, bool on)
+ {
+ 	struct rkcif_device *cif_dev = container_of(p, struct rkcif_device, pipe);
+@@ -513,6 +523,12 @@ static int rkcif_pipeline_set_stream(struct rkcif_pipeline *p, bool on)
+ 
+ 		/* phy -> sensor */
+ 		for (i = 0; i < p->num_subdevs; i++) {
++			if (rkcif_pipe_sd_stale(p->subdevs[i])) {
++				v4l2_err(&cif_dev->v4l2_dev,
++					 "CCS: skip stale pipe subdev[%d]=%p (on=%d)\n",
++					 i, p->subdevs[i], on);
++				continue;
++			}
+ 			ret = v4l2_subdev_call(p->subdevs[i], video, s_stream, on);
+ 			if (on && ret < 0 && ret != -ENOIOCTLCMD && ret != -ENODEV)
+ 				goto err_stream_off;
+@@ -559,6 +575,12 @@ static int rkcif_pipeline_set_stream(struct rkcif_pipeline *p, bool on)
+ 
+ 			/* phy -> sensor */
+ 			for (i = 0; i < p->num_subdevs; i++) {
++				if (rkcif_pipe_sd_stale(p->subdevs[i])) {
++					v4l2_err(&cif_dev->v4l2_dev,
++						 "CCS: skip stale pipe subdev[%d]=%p (on=%d)\n",
++						 i, p->subdevs[i], on);
++					continue;
++				}
+ 				ret = v4l2_subdev_call(p->subdevs[i], video, s_stream, on);
+ 
+ 				if (on && ret < 0 && ret != -ENOIOCTLCMD && ret != -ENODEV)
+-- 
+2.43.0
+
