@@ -274,11 +274,33 @@ def build_edid(name, timing, mfr, product, serial, year, week, hcm, vcm,
             raise ValueError(f'像素时钟 {t["pclk"] / 100:.1f}MHz 超限'
                              f'（TC358743 上限 165MHz），降低刷新率或分辨率')
         if t['pclk'] < 3500:
-            raise ValueError(f'像素时钟 {t["pclk"] / 100:.1f}MHz 过低：'
-                             f'TC358743 在 <35MHz 时 CSI 侧会周期性丢帧尾'
-                             f'（画面每 ~8s 跳一次，800x500@60=29.7MHz 实测；'
-                             f'800x600@60=35.4MHz、800x500@75=37.3MHz 干净），'
-                             f'请提高刷新率或分辨率')
+            sugg = []
+            # 建议1：同分辨率提高刷新率，先扫常见档再扫任意值
+            cands = [r for r in (65, 70, 72, 75) if r > cr]
+            cands += [r for r in range(cr + 1, 76) if r not in cands]
+            for r2 in cands:
+                t2 = cvt_rb(cw, ch, r2)
+                if 3500 <= t2['pclk'] <= 16000:
+                    sugg.append(f'{cw}x{ch}@{r2}（{t2["pclk"] / 100:.1f}MHz）')
+                    break
+            # 建议2：同刷新率加高分辨率（pclk 随高度近似线性增长），
+            # 高度向上凑整到 10 的倍数，给出好看的值（592→600）
+            for h2 in range(ch + 2, 1081, 2):
+                t2 = cvt_rb(cw, h2, cr)
+                if 3500 <= t2['pclk'] <= 16000:
+                    h2 = min(1080, (h2 + 9) // 10 * 10)
+                    t2 = cvt_rb(cw, h2, cr)
+                    if 3500 <= t2['pclk'] <= 16000:
+                        sugg.append(f'{cw}x{h2}@{cr}（{t2["pclk"] / 100:.1f}MHz）')
+                    break
+            msg = (f'像素时钟 {t["pclk"] / 100:.1f}MHz 过低：TC358743 '
+                   f'在 <35MHz 时 CSI 侧会周期性多发帧头，画面每隔几秒'
+                   f'跳一次（芯片固有限制，软件无法修复）。')
+            if sugg:
+                msg += '可用替代：' + ' 或 '.join(sugg)
+            else:
+                msg += '该宽度在允许范围内无法达标，请加大宽度/分辨率'
+            raise ValueError(msg)
     elif timing in EDID_TIMINGS:
         t = EDID_TIMINGS[timing]
     else:
