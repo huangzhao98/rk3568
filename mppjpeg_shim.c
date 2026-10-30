@@ -49,6 +49,12 @@ typedef struct {
 static EncSlot s_e[2];
 static int s_ninst = 0;
 static int s_w, s_h, s_fsize;
+static int s_bsize;   /* 输入缓冲实际大小：高度按 16 行对齐。vepu 按宏块
+                       * 读输入，h 非 16 倍数时硬件会读到 ALIGN(h,16) 行
+                       * （mpp 日志 stride [w:512]），缓冲只给 w*h*2 就是
+                       * DMA 越界读——IOMMU 缺页/总线挂死，整机无日志猝死
+                       * （2026-10-30 三次实捕：800x500@60 hw编码 1~2 分钟
+                       * 必死，720p 因 720%16==0 从无此问题） */
 static unsigned char s_lut_y[256], s_lut_uv[256];
 static unsigned char s_lut_yf[256];   /* 亮度增益 ∘ limited→full 复合 LUT */
 static int s_sharp = 0;               /* 锐化强度 0~100，0=关 */
@@ -102,8 +108,11 @@ static int slot_open(EncSlot *e, int w, int h)
     if (e->mpi->control(e->ctx, MPP_ENC_SET_CFG, cfg))
         return -3;
 
-    if (mpp_buffer_get(NULL, &e->in, s_fsize))
+    if (mpp_buffer_get(NULL, &e->in, s_bsize))
         return -4;
+    /* 垫高行（h..ALIGN(h,16)）清一次零：内容本不会被 JPEG 头引用
+     * （height=h 解码即裁掉），但别让 vepu 读到随机数据 */
+    memset(mpp_buffer_get_ptr(e->in), 0, s_bsize);
     if (mpp_buffer_get(NULL, &e->out, s_fsize))
         return -5;
     return 0;
@@ -114,6 +123,7 @@ int mppjpeg_open(int w, int h)
     s_w = w;
     s_h = h;
     s_fsize = w * h * 2;
+    s_bsize = w * ((h + 15) & ~15) * 2;   /* 见 s_bsize 声明处注释 */
     build_luts();
     mppjpeg_set_filter(s_bright, s_sharp);   /* 重开编码器后恢复补偿参数 */
 

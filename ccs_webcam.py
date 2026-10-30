@@ -273,6 +273,12 @@ def build_edid(name, timing, mfr, product, serial, year, week, hcm, vcm,
         if t['pclk'] > 16000:
             raise ValueError(f'像素时钟 {t["pclk"] / 100:.1f}MHz 超限'
                              f'（TC358743 上限 165MHz），降低刷新率或分辨率')
+        if t['pclk'] < 3500:
+            raise ValueError(f'像素时钟 {t["pclk"] / 100:.1f}MHz 过低：'
+                             f'TC358743 在 <35MHz 时 CSI 侧会周期性丢帧尾'
+                             f'（画面每 ~8s 跳一次，800x500@60=29.7MHz 实测；'
+                             f'800x600@60=35.4MHz、800x500@75=37.3MHz 干净），'
+                             f'请提高刷新率或分辨率')
     elif timing in EDID_TIMINGS:
         t = EDID_TIMINGS[timing]
     else:
