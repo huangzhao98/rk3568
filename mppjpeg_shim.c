@@ -49,12 +49,15 @@ typedef struct {
 static EncSlot s_e[2];
 static int s_ninst = 0;
 static int s_w, s_h, s_fsize;
-static int s_bsize;   /* 输入缓冲实际大小：高度按 16 行对齐。vepu 按宏块
-                       * 读输入，h 非 16 倍数时硬件会读到 ALIGN(h,16) 行
-                       * （mpp 日志 stride [w:512]），缓冲只给 w*h*2 就是
-                       * DMA 越界读——IOMMU 缺页/总线挂死，整机无日志猝死
-                       * （2026-10-30 三次实捕：800x500@60 hw编码 1~2 分钟
-                       * 必死，720p 因 720%16==0 从无此问题） */
+static int s_bsize;   /* 输入缓冲实际大小：宽 8 像素对齐 × 高 16 行对齐。
+                       * vepu 对 YUV422 要求水平 stride 8 像素对齐、按宏块
+                       * 读高度到 ALIGN(h,16)（mpp 日志实捕：1274 宽被强制
+                       * 按 2560 字节/行读、800x500 stride [w:512]）。缓冲
+                       * 只给 w*h*2 就是 DMA 越界读——IOMMU 缺页/总线挂死，
+                       * 整机无日志猝死（2026-10-30 四次实捕：800x500 高不对齐、
+                       * 1360x768 缩放出 1274x720 宽不对齐，各死两次；
+                       * 720p 因 1280/720 双对齐从无此问题） */
+static int s_stride;  /* 输入水平 stride（像素）= ALIGN(w,8)，喂数据按它摆放 */
 static unsigned char s_lut_y[256], s_lut_uv[256];
 static unsigned char s_lut_yf[256];   /* 亮度增益 ∘ limited→full 复合 LUT */
 static int s_sharp = 0;               /* 锐化强度 0~100，0=关 */
@@ -96,8 +99,8 @@ static int slot_open(EncSlot *e, int w, int h)
     mpp_enc_cfg_init(&cfg);
     mpp_enc_cfg_set_s32(cfg, "prep:width", w);
     mpp_enc_cfg_set_s32(cfg, "prep:height", h);
-    mpp_enc_cfg_set_s32(cfg, "prep:hor_stride", w);
-    mpp_enc_cfg_set_s32(cfg, "prep:ver_stride", h);
+    mpp_enc_cfg_set_s32(cfg, "prep:hor_stride", s_stride);
+    mpp_enc_cfg_set_s32(cfg, "prep:ver_stride", (h + 15) & ~15);
     mpp_enc_cfg_set_s32(cfg, "prep:format", MPP_FMT_YUV422_UYVY);
     mpp_enc_cfg_set_s32(cfg, "rc:mode", MPP_ENC_RC_MODE_FIXQP);
     mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num", 60);
@@ -123,7 +126,8 @@ int mppjpeg_open(int w, int h)
     s_w = w;
     s_h = h;
     s_fsize = w * h * 2;
-    s_bsize = w * ((h + 15) & ~15) * 2;   /* 见 s_bsize 声明处注释 */
+    s_stride = (w + 7) & ~7;                    /* vepu YUV422 水平 8 像素对齐 */
+    s_bsize = s_stride * ((h + 15) & ~15) * 2;  /* 见 s_bsize 声明处注释 */
     build_luts();
     mppjpeg_set_filter(s_bright, s_sharp);   /* 重开编码器后恢复补偿参数 */
 
@@ -151,7 +155,7 @@ static void filter_rows(unsigned char *d, const unsigned char *s, int r0, int r1
 {
     for (int r = r0; r < r1; r++) {
         const unsigned char *sr = s + r * s_w * 2;
-        unsigned char *dr = d + r * s_w * 2;
+        unsigned char *dr = d + r * s_stride * 2;   /* 目标按 vepu 对齐 stride */
         for (int x = 0; x + 1 < s_w; x += 2) {
             dr[2 * x]     = s_lut_uv[sr[2 * x]];
             dr[2 * x + 2] = s_lut_uv[sr[2 * x + 2]];
@@ -220,8 +224,8 @@ int mppjpeg_submit(int idx, const char *uyvy, int len)
     mpp_frame_init(&frame);
     mpp_frame_set_width(frame, s_w);
     mpp_frame_set_height(frame, s_h);
-    mpp_frame_set_hor_stride(frame, s_w);
-    mpp_frame_set_ver_stride(frame, s_h);
+    mpp_frame_set_hor_stride(frame, s_stride);
+    mpp_frame_set_ver_stride(frame, (s_h + 15) & ~15);
     mpp_frame_set_fmt(frame, MPP_FMT_YUV422_UYVY);
     mpp_frame_set_buffer(frame, e->in);
 

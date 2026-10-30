@@ -248,7 +248,7 @@ for _w, _h, _r in [
     (1024, 768, 60),     # XGA
     (1280, 960, 60),     # 4:3
     (1280, 1024, 60),    # SXGA 5:4 老液晶最常见
-    (1366, 768, 60),     # 老笔记本
+    (1360, 768, 60),     # 老笔记本（1366 非 8 倍数被 CVT 截断，禁用）
     (1600, 900, 60),     # 16:9
     (1280, 800, 60),     # WXGA 16:10
     (1440, 900, 60),     # 16:10
@@ -259,7 +259,9 @@ for _w, _h, _r in [
     (800, 800, 60),      # 方形
     (1920, 480, 60),     # 超宽条形
 ]:
-    EDID_TIMINGS[f'{_w}x{_h}@{_r}'] = cvt_rb(_w, _h, _r)
+    _t = cvt_rb(_w, _h, _r)
+    assert _t['ha'] == _w and _t['va'] == _h, f'预设 {_w}x{_h} 被 CVT 粒度截断'
+    EDID_TIMINGS[f'{_w}x{_h}@{_r}'] = _t
 del _w, _h, _r
 
 
@@ -291,6 +293,9 @@ def build_edid(name, timing, mfr, product, serial, year, week, hcm, vcm,
             raise ValueError('自定义分辨率参数缺失')
         if not (640 <= cw <= 1920 and 400 <= ch <= 1080 and 24 <= cr <= 75):
             raise ValueError('自定义范围：宽640-1920 高400-1080 刷新率24-75')
+        if cw % 8:
+            raise ValueError(f'宽度 {cw} 不是 8 的倍数（CVT 时序粒度），'
+                             f'请用 {cw - cw % 8} 或 {cw + 8 - cw % 8}')
         ch &= ~1  # YUV422 采集要求偶数行高，奇数自动向下取偶
         t = cvt_rb(cw, ch, cr)
         if t['pclk'] > 16000:
@@ -1329,9 +1334,12 @@ def _config_stream(cap, w, h):
 
 def _enc_size(w, h):
     """编码几何：vepu 硬编 720p ~11ms/帧而 1080p >1s/帧，超过 720p 的源
-    等比降到 720p 框内（取偶）再编码。<=720p 原样。"""
+    等比降到 720p 框内再编码。宽按 16、高按 8 向下对齐——取两个 shim
+    的交集：sw422(ljpeg422) 要 w%16==0/h%8==0，vepu 要水平 stride 8 对齐
+    （1360x768 源曾缩出 1274x720：vepu 强按 1280 宽读越界死机，且 1272
+    又过不了 sw422 的 %16 → 双双回退 pil，§28f）。<=720p 原样。"""
     r = min(1.0, 1280 / w, 720 / h)
-    return max(2, int(w * r) // 2 * 2), max(2, int(h * r) // 2 * 2)
+    return max(16, int(w * r) // 16 * 16), max(8, int(h * r) // 8 * 8)
 
 
 def _follow_source(cap, subdev):
