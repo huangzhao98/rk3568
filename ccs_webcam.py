@@ -1162,6 +1162,10 @@ class GstBE:
             if m.type == Gst.MessageType.ERROR:
                 err, _ = m.parse_error()
                 print(f"[gst] {err.message}", flush=True)
+                # 2026-10-30 实捕：gst 管线可能静默卡死（无 ERROR 也有一条
+                # 路——appsink 永远 None），有 ERROR 更是铁证。打时间戳
+                # 交给看门狗重建管线，比"无帧 15s"更快更准
+                self.cap.gst_dead = time.time()
 
 
 def _adopt_detected_timings():
@@ -2014,20 +2018,23 @@ def align_supervisor(cap):
     而 in_align 又屏蔽了挂死看门狗 → 无人兜底。本线程独立盯 state：
     aligning/init 持续 >170s（>内部 150s 截止，正常对齐不可能到这）直接
     自杀，systemd Restart=always 拉起全新进程走干净恢复（~15s）。
+    判定用"上次脱离对齐或对齐置信的时刻"而非 state 字符串变化——
+    attempt 计数（aligning#1→#2）会改字符串，但 gst 管线静默卡死时
+    attempt 永远测不到帧、对齐永不置信，空转多久都不算恢复（第三次
+    实捕 2026-10-30 晚：state 在 aligning#1/#2 间翻转而卡死依旧）。
     调试：kill -USR1 <pid> 可经 faulthandler 喷全线程栈到 journal。"""
-    since = None
+    last_ok = time.time()
     while True:
         time.sleep(10)
         st = cap.state or ''
-        if st.startswith('aligning') or st == 'init':
-            if since is None:
-                since = time.time()
-            elif time.time() - since > 170:
-                print(f"[supervisor] 对齐卡死 {time.time() - since:.0f}s "
-                      f"(state={st})，自杀由 systemd 拉起恢复", flush=True)
-                os._exit(70)
-        else:
-            since = None
+        if not (st.startswith('aligning') or st == 'init') or \
+                getattr(cap, 'align_conf', False):
+            last_ok = time.time()          # 不在对齐，或对齐已置信 = 健康
+            continue
+        if time.time() - last_ok > 170:
+            print(f"[supervisor] 对齐卡死 {time.time() - last_ok:.0f}s "
+                  f"(state={st})，自杀由 systemd 拉起恢复", flush=True)
+            os._exit(70)
 
 
 def watchdog(cap):
@@ -2042,6 +2049,7 @@ def watchdog(cap):
     was_ok = has_signal(subdev)
     ok_since = time.time() if was_ok else 0.0   # 信号连续在的起点
     last_reset = 0.0
+    last_rebuild = 0.0                           # 管线上次重建时刻（pipe_dead 用）
     while True:
         time.sleep(1.5)
         t_q = time.time()
@@ -2076,16 +2084,42 @@ def watchdog(cap):
             was_ok = ok
             idle = now - cap.last_frame_ts
             # 挂死复位两级门槛：
-            #  - qd>2s（dv 查询本身超时）= i2c 挂死特征，10s 即复位；
+            #  - qd>2s（dv 查询本身超时）= i2c 挂死特征，10s 即复位芯片；
             #  - 信号在但无帧：必须按"信号回来后"计时！idle 从最后一帧
             #    算起会把整段拔出时长计入，而驱动的延迟解静音在信号恢复
             #    后要 4s 稳定期才出帧——2026-10-27 实测：HPD 重插后看门狗
             #    在驱动即将解静音时误触发硬复位杀掉 work_unmute，gst 管线
             #    随后进入永久 Internal data stream error 抖动，只能重启
             #    服务。信号连续在 15s 仍无帧才是真死了
-            wedged = (idle > 10 and qd > 2.0) or \
-                     (ok_since and now - ok_since > 15 and idle > 10)
-            if wedged and now - last_reset > 60:
+            # 2026-10-30 实捕修正：两种故障的病灶不同，必须分开处理——
+            #  "信号在但无帧" 多为 gst 管线静默卡死（芯片锁定、rkcif 中断
+            #    照跑、appsink 永远 None、总线无 ERROR），复位健康芯片毫无
+            #    作用还制造扰动（当晚连复位 8 次）。先重建采集管线；
+            #    90s 内重建过仍无帧 → 重启服务（实测重启即恢复）
+            chip_wedged = idle > 10 and qd > 2.0
+            pipe_dead = (ok_since and now - ok_since > 15 and idle > 10) or \
+                        (getattr(cap, 'gst_dead', 0.0) > last_rebuild)
+            if pipe_dead and not chip_wedged:
+                if last_rebuild and now - last_rebuild < 90:
+                    print("[watchdog] pipeline rebuild didn't help -> "
+                          "self-restart via systemd", flush=True)
+                    os._exit(1)
+                last_rebuild = now
+                print(f"[watchdog] signal OK but no frames idle={idle:.0f}s "
+                      f"-> rebuild pipeline", flush=True)
+                try:
+                    if cap.be_name == 'gst':
+                        cap._gst.build(cap.w, cap.h)   # free+重建， caps 不变
+                        cap.stream_on()                # NULL→PLAYING
+                    else:
+                        cap.stream_off()
+                        cap.stream_on()
+                except Exception as e:
+                    print(f"[watchdog] pipeline rebuild: {e!r}", flush=True)
+                cap.last_frame_ts = time.time()
+                cap.need_realign.set()
+                continue
+            if chip_wedged and now - last_reset > 60:
                 last_reset = now                   # 冷却 60s：复位后重探测/重对齐
                 print(f"[watchdog] chip wedged? idle={idle:.0f}s qd={qd:.1f}s "  # 期间别再触发
                       f"-> hard reset", flush=True)

@@ -115,6 +115,9 @@ systemd 服务 `ccs_webcam.service`）。
 - **对齐卡死有 align_supervisor 兜底**（170s 自杀自愈）；再遇到先
   `kill -USR1 $(pgrep -f "ccs_webcam.py --port")` 让 faulthandler 喷
   全线程栈到 journal 取证，别直接重启
+- **"信号在但无帧"≠芯片死**（§28d 实捕）：gst 管线会静默卡死（芯片
+  锁定、rkcif 中断照跑、appsink 永远 None、总线无 ERROR），复位芯片
+  无用且有害。看门狗已分流：qd>2s 才复位芯片，否则重建管线/重启服务
   变化；让电脑重读不用再物理拔线——写 TC358743 HPD_CTL(0x8544) 拉低 2s
   再拉高即可（经 MS9332 传导，§28b），但**开机门控期（ccs_webcam 未
   active）绝不可碰 HPD**
