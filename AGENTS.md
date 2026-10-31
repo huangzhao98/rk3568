@@ -132,6 +132,10 @@ systemd 服务 `ccs_webcam.service`）。
 - **对齐卡死有 align_supervisor 兜底**（170s 自杀自愈）；再遇到先
   `kill -USR1 $(pgrep -f "ccs_webcam.py --port")` 让 faulthandler 喷
   全线程栈到 journal 取证，别直接重启
+- **align failed（全程无帧彻底失败）已有 30s 自动重试直到成功一次**
+  （§28i 首烧事故：重锁后源 40s+ 不出帧，3×20s 尝试烧光挂 4.7h）；
+  重锁后等帧窗口已放宽到 60s。"不周期性重对齐"仅指成功/未置信后
+  不打扰——别把重试逻辑当成违反该要求删掉
 - **"信号在但无帧"≠芯片死**（§28d 实捕）：gst 管线会静默卡死（芯片
   锁定、rkcif 中断照跑、appsink 永远 None、总线无 ERROR），复位芯片
   无用且有害。看门狗已分流：qd>2s 才复位芯片，否则重建管线/重启服务
