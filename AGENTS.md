@@ -44,7 +44,7 @@ systemd 服务 `ccs_webcam.service`）。
 2. **网页 1s 可开**：首次对齐挪进采集线程，不再阻塞 HTTP 绑定
 3. **网页状态遮罩**：断线提示"无视频输入信号"，对齐中显示"对齐中…"
    （JS 2s 轮询 /stat，aligning 优先于无信号；sig_ok 看门狗每拍更新）
-4. **内核 tc35874x 驱动**（13 个补丁，见 kernel-patches/）：
+4. **内核 tc35874x 驱动**（14 个补丁，见 kernel-patches/）：
    HUB 供电识别、相位固定、延迟解静音、i2c 挂死自救、
    TMDS 在而 SYNC 超 60s 自救复位、热拔插提速、漏边恢复
    （芯片先于驱动锁定时轮询比对补走 format_change，否则时序
@@ -117,6 +117,15 @@ systemd 服务 `ccs_webcam.service`）。
   且 s_stream(1) 快路径"未静音即认为 TX 在跑"永远跳过 enable_stream，
   一旦丢失无任何路径补回。驱动已在 self_reset 和 s_stream 快路径两处
   幂等补写——改驱动时注意保持这两处
+- **FIFOCTL 阈值必须 < 一行 FIFO 字数**（§28h 实捕）：FIFOCTL(0x0006)
+  是 10bit 字段（写 1500 被截成 476），阈值 ≥ width/2（UYVY 一行字数）
+  时 TX 在一行内攒不到启动水位、看不到消隐行间隙，帧边界失同步自跑，
+  画面匀速连续卷动（800 宽时序发病，720p/1080p/1360×768 不发病）。
+  驱动已按 clamp_val(width/2-30, 100, 476) 封顶；且 FIFOCTL 会被
+  get_detected_timings 周期性重写，手动 i2c 改只维持 ~1 秒
+- **/frame.raw 是打包 UYVY，Y 在奇数字节**：把前 half 当 Y 平面的
+  SAD/PNG 全是垃圾数据；测卷动用 /tmp/roll_diag/sad.py（d[1::2]）+
+  相位轨迹法（每秒一帧逐一 SAD），别用"等事件前后抓帧"
 - self_reset 会断 HPD，源（经 MS9332）可能因此停输出——**禁止在
   对齐期（in_align）连续触发 self_reset**（2026-10-31 风暴实捕）；
   链路卡死自愈统一走 pipe_dead 分级路径（重建管线→90s→中断静止才复位）
@@ -140,6 +149,6 @@ systemd 服务 `ccs_webcam.service`）。
 1. `git clone git@github.com:huangzhao98/rk3568.git`（本仓库）
 2. `git clone git@github.com:huangzhao98/rk3568-kernel.git`（内核完整源码）
 3. 完整 SDK（几十个 GB，repo 管理）不在 GitHub 上，需要的话从原开发机
-   拷贝或用 rockchip 官方渠道重新同步，然后把 kernel-patches/ 里 11 个
+   拷贝或用 rockchip 官方渠道重新同步，然后把 kernel-patches/ 里 14 个
    补丁 `git am` 到 SDK 的 kernel 目录
 4. 读 `README_开发流程.md`、`61_文件地图.md` 建立全局认识
