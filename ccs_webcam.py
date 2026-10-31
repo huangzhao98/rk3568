@@ -774,6 +774,10 @@ class Capture:
         self.align_via = 'none'    # 最近对齐判定途径 split/taskbar/band/ref/seam/none
         self.ref = None            # 已对齐参考帧（置信时更新，供轮廓相关测相位）
         self.last_frame_ts = time.time()   # 看门狗判芯片挂死用
+        self.last_frame_real = time.time()  # 主循环真拿到帧的时刻（对齐内部
+                                             # 探测帧不算；链路卡死时空对齐
+                                             # 循环会刷新 last_frame_ts 饿死
+                                             # 看门狗，2026-10-31 实捕）
         # JPEG 硬编：mppjpeg_open 成功则用 vepu（720p ~11ms/帧；1080p 实测
         # >1s/帧不可用，所以 >720p 的源一律降到 720p 再进编码器），失败回退 PIL
         self.enc = 'pil'
@@ -2157,6 +2161,19 @@ def watchdog(cap):
     ok_since = time.time() if was_ok else 0.0   # 信号连续在的起点
     last_reset = 0.0
     last_rebuild = 0.0                           # 管线上次重建时刻（pipe_dead 用）
+
+    def _cif_irq():
+        """rkcif 帧中断计数（-1=读不到）。计数静止=TX↔rkcif 链路级卡死，
+        唯芯片自救复位可解；照跑才是上层管线问题（重建/重启服务即可）"""
+        try:
+            with open('/proc/interrupts') as _f:
+                for _ln in _f:
+                    if 'rkcif' in _ln:
+                        return int(_ln.split()[1])
+        except Exception:
+            pass
+        return -1
+
     while True:
         time.sleep(1.5)
         t_q = time.time()
@@ -2174,6 +2191,24 @@ def watchdog(cap):
         if cap.in_align.is_set():
             was_ok = ok                            # 跟随基线，不触发
             cap.last_frame_ts = now                # 对齐期不做挂死判定
+            # 对齐不能屏蔽链路级卡死检测（2026-10-31 实捕：链路死时对齐
+            # 永远拿不到帧只会空转重试，last_frame_ts 又被对齐探测帧刷新，
+            # 看门狗被 in_align 饿死整晚——720p 下芯片锁定 SYS=0x8f、
+            # DE 正常但 rkcif 中断静止，手动 self_reset 秒恢复）
+            real_idle = now - getattr(cap, 'last_frame_real', now)
+            if ok and real_idle > 60 and \
+                    (not last_reset or now - last_reset > 60):
+                _i0 = _cif_irq()
+                time.sleep(2)
+                _i1 = _cif_irq()
+                if 0 <= _i0 == _i1 and \
+                        os.path.exists('/sys/bus/i2c/devices/4-000f/self_reset'):
+                    last_reset = now
+                    print("[watchdog] align loop + rkcif irq silent "
+                          "-> chip self reset", flush=True)
+                    sh('echo 1 > /sys/bus/i2c/devices/4-000f/self_reset')
+                    cap.last_frame_ts = cap.last_frame_real = time.time()
+                    cap.need_realign.set()
         else:
             if ok and not was_ok:
                 # 信号掉过又回来 = 芯片中途重锁。相位是否可疑看驱动
@@ -2213,15 +2248,6 @@ def watchdog(cap):
                     # 但 rkcif 计数停走），重建/重启服务都救不回，唯芯片自救
                     # 复位可解（2026-10-30 800x500@CVT-RB 实测）；中断照跑才是
                     # gst 静默卡死（§28d），重启服务恢复
-                    def _cif_irq():
-                        try:
-                            with open('/proc/interrupts') as _f:
-                                for _ln in _f:
-                                    if 'rkcif' in _ln:
-                                        return int(_ln.split()[1])
-                        except Exception:
-                            pass
-                        return -1
                     _i0, _i1 = _cif_irq(), None
                     time.sleep(1)
                     _i1 = _cif_irq()
@@ -3075,6 +3101,9 @@ def main():
                         continue
                     empty = 0
                     cap.last_frame_ts = time.time()
+                    cap.last_frame_real = time.time()   # 真拿到帧才刷新；对齐
+                                                        # 内部探测帧不动它（链路
+                                                        # 卡死检测靠它）
                     tg += time.time() - _t; _t = time.time()
                     # track 后台相位复测已整体移除（2026-10-29 零图像识别）：
                     # 它的内容检测链在客户设备 UI 上稳定误报——实测 split 把
