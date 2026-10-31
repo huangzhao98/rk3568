@@ -778,6 +778,10 @@ class Capture:
                                              # 探测帧不算；链路卡死时空对齐
                                              # 循环会刷新 last_frame_ts 饿死
                                              # 看门狗，2026-10-31 实捕）
+        self.hpd_active = threading.Event()  # HPD 干净重锁进行中：源被故意
+                                             # 停输出、中断静止是正常态，
+                                             # 看门狗链路卡死检测必须回避
+                                             # （2026-10-31 误伤实捕）
         # JPEG 硬编：mppjpeg_open 成功则用 vepu（720p ~11ms/帧；1080p 实测
         # >1s/帧不可用，所以 >720p 的源一律降到 720p 再进编码器），失败回退 PIL
         self.enc = 'pil'
@@ -1936,7 +1940,11 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                 # 返回 2（重锁发生了但驱动仍标脏）可重试，最多 3 次
                 hpd_tries += 1
                 print("[align] 跳过内容测量，直接干净重锁锚定相位 0", flush=True)
-                r = _hpd_clean_relock(tc)
+                cap.hpd_active.set()
+                try:
+                    r = _hpd_clean_relock(tc)
+                finally:
+                    cap.hpd_active.clear()
                 relocked = (r == 1)
                 if relocked:
                     cap.ref = None
@@ -2016,7 +2024,11 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                 # 第一处调用点合计最多 3 次，不会反复打扰源
                 hpd_tries += 1
                 print("[align] 测不出相位 → 干净重锁锚定相位 0", flush=True)
-                r = _hpd_clean_relock(tc)
+                cap.hpd_active.set()
+                try:
+                    r = _hpd_clean_relock(tc)
+                finally:
+                    cap.hpd_active.clear()
                 relocked = (r == 1)
                 if relocked:
                     # 相位已归零重建：旧参考帧/持久化相位全部失效，连文件
@@ -2196,7 +2208,7 @@ def watchdog(cap):
             # 看门狗被 in_align 饿死整晚——720p 下芯片锁定 SYS=0x8f、
             # DE 正常但 rkcif 中断静止，手动 self_reset 秒恢复）
             real_idle = now - getattr(cap, 'last_frame_real', now)
-            if ok and real_idle > 60 and \
+            if ok and not cap.hpd_active.is_set() and real_idle > 60 and \
                     (not last_reset or now - last_reset > 60):
                 _i0 = _cif_irq()
                 time.sleep(2)
