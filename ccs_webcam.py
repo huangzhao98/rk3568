@@ -1950,14 +1950,20 @@ def align_and_start(cap, subdev, w, h, max_retry=3):
                 else:
                     hpd_tries = 3           # 源不理会 HPD：重试无意义
                 continue
-            win = 20
+            # 重锁后源恢复可能很慢（Windows 正在切分辨率时被 HPD 打断，
+            # 实测 >40s 才重新出图）：本轮窗口放宽到 60s 等够——等不够会
+            # 把尝试次数烧光，且每次烧尝试前的 _config_stream 都在无信号
+            # 期重新布防重新摇骰，帧恢复时相位必随机（2026-10-31 量产首烧
+            # 事故：3×20s 耗尽 → align failed，静态卷半屏挂 4.7h）
+            win = 60 if relocked else 20
+            none_limit = 15 if relocked else 5
             stable_gate = 3 if (clean_start or relocked) else 10
             while time.time() - t0 < win:
                 f = cap.grab_latest(timeout=4)
                 if f is None:
                     none_streak += 1
-                    if none_streak >= 5:             # ~20s 无一帧 → 放弃本轮
-                        break
+                    if none_streak >= none_limit:      # ~20s 无一帧 → 放弃本轮
+                        break                          # （重锁后放宽到 ~60s）
                     continue
                 none_streak = 0
                 cap.last_frame_ts = time.time()
@@ -3074,6 +3080,17 @@ def main():
                             continue
                     raw = align_and_start(cap, find_subdev(), args.width, args.height)
                     empty = 0
+                    if raw is None:
+                        # 对齐彻底失败（全程无帧，多为重锁后源恢复太慢把尝试
+                        # 次数烧光）→ 30s 后自动重试直到成功一次。"不周期性
+                        # 重对齐"指的是成功之后不打扰，不是失败后永久放弃
+                        # （2026-10-31 量产首烧：align failed 挂 4.7h 静态卷，
+                        # 期间无人重试）。有信号才重试，没信号安静等
+                        def _align_retry():
+                            if not cap.align_conf and \
+                                    has_signal(find_subdev()):
+                                cap.need_realign.set()
+                        threading.Timer(30, _align_retry).start()
                     continue
                 # 对齐未置信时也不自动周期性重对齐（2026-10-26 用户明确要求）：
                 # 开机对齐一次即可，后续若再卷动由 /realign 接口或网页按钮手动
