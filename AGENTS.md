@@ -44,7 +44,7 @@ systemd 服务 `ccs_webcam.service`）。
 2. **网页 1s 可开**：首次对齐挪进采集线程，不再阻塞 HTTP 绑定
 3. **网页状态遮罩**：断线提示"无视频输入信号"，对齐中显示"对齐中…"
    （JS 2s 轮询 /stat，aligning 优先于无信号；sig_ok 看门狗每拍更新）
-4. **内核 tc35874x 驱动**（11 个 commit，见 kernel-patches/）：
+4. **内核 tc35874x 驱动**（13 个补丁，见 kernel-patches/）：
    HUB 供电识别、相位固定、延迟解静音、i2c 挂死自救、
    TMDS 在而 SYNC 超 60s 自救复位、热拔插提速、漏边恢复
    （芯片先于驱动锁定时轮询比对补走 format_change，否则时序
@@ -112,6 +112,14 @@ systemd 服务 `ccs_webcam.service`）。
   unbind/bind 会让 rkcif pipeline subdevs[] 缓存野指针，streamoff
   OOPS 在持 stream_lock 上下文 → 锁泄漏 → open() 永久 D 态只能重启
   整机。硬复位一律走 `echo 1 > /sys/bus/i2c/devices/4-000f/self_reset`
+- **芯片硬复位会丢 CONFCTL VBUFEN**（§28g 实捕）：self_reset 后若不补
+  VBUFEN/ABUFEN，TX 永久停摆零帧（SYS=0x8f 锁定、已解静音但 TXACT=0），
+  且 s_stream(1) 快路径"未静音即认为 TX 在跑"永远跳过 enable_stream，
+  一旦丢失无任何路径补回。驱动已在 self_reset 和 s_stream 快路径两处
+  幂等补写——改驱动时注意保持这两处
+- self_reset 会断 HPD，源（经 MS9332）可能因此停输出——**禁止在
+  对齐期（in_align）连续触发 self_reset**（2026-10-31 风暴实捕）；
+  链路卡死自愈统一走 pipe_dead 分级路径（重建管线→90s→中断静止才复位）
 - **对齐卡死有 align_supervisor 兜底**（170s 自杀自愈）；再遇到先
   `kill -USR1 $(pgrep -f "ccs_webcam.py --port")` 让 faulthandler 喷
   全线程栈到 journal 取证，别直接重启

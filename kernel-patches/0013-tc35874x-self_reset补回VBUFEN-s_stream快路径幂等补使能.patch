@@ -1,0 +1,65 @@
+From 331e7d6de24ce19603fe827424273af2cd73ebbb Mon Sep 17 00:00:00 2001
+From: huangzhao <huangzhao@WIN-TLG0U98OLAE>
+Date: Sat, 31 Oct 2026 11:04:46 +0800
+Subject: [PATCH] =?UTF-8?q?=C2=A728g:=20tc35874x=20self=5Freset=20?=
+ =?UTF-8?q?=E5=90=8E=E8=A1=A5=E5=9B=9E=20CONFCTL=20VBUFEN/ABUFEN=EF=BC=8Cs?=
+ =?UTF-8?q?=5Fstream=20=E5=BF=AB=E8=B7=AF=E5=BE=84=E5=B9=82=E7=AD=89?=
+ =?UTF-8?q?=E8=A1=A5=E4=BD=BF=E8=83=BD?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+实捕：self_reset 的 GPIO 硬复位把 CONFCTL 清回默认值（VBUFEN=0），
+复位重建只恢复 PLL/CSI/音频，没有任何路径再补 VBUFEN；deferred
+unmute 解除 VI_MUTE 后 s_stream(1) 走 'tx already running' 快路径
+跳过 enable_stream → TX 永久停摆零帧（SYS=0x8f 锁定、已解静音但
+CSI_STATUS TXACT=0）。2026-10-31 EDID 1360x768 切换场景：看门狗
+in_align 分支风暴期的首次 self_reset 即丢 VBUFEN，之后跨断电重启
+'确定复现'的链路卡死其实是同一状态的反复进入。手动 i2c 置 VBUFEN
+后 1360x768 立即 59.9fps 恢复实锤。
+修复：self_reset 末尾 stream_on 时补 VBUFEN|ABUFEN；s_stream(1)
+快路径幂等补使能（'未静音'不能证明 TX 在跑）。
+---
+ drivers/media/i2c/tc35874x.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/drivers/media/i2c/tc35874x.c b/drivers/media/i2c/tc35874x.c
+index 6a1856f21..78b8cd0d9 100644
+--- a/drivers/media/i2c/tc35874x.c
++++ b/drivers/media/i2c/tc35874x.c
+@@ -759,6 +759,18 @@ static void tc35874x_self_reset(struct tc35874x_state *state)
+ 	else
+ 		tc35874x_enable_interrupts(sd, false);
+ 	i2c_wr8(sd, VI_MUTE, MASK_AUTO_MUTE | MASK_VI_MUTE);
++	/* 硬件复位把 CONFCTL 清成默认值，VBUFEN/ABUFEN 丢失；这里只重建了
++	 * PLL/CSI/音频，没有任何路径会再补 VBUFEN——deferred unmute 解除
++	 * VI_MUTE 后 s_stream(1) 走"tx already running"快路径跳过
++	 * enable_stream，TX 永久停摆零帧（2026-10-31 实捕：SYS=0x8f 锁定、
++	 * 已解静音，但 CONFCTL=0x0cd4 VBUFEN=0、CSI_STATUS TXACT=0，手动置
++	 * VBUFEN 后 1360x768 立即 59.9fps 恢复）。开流状态下必须补回。 */
++	if (state->stream_on) {
++		mutex_lock(&state->confctl_mutex);
++		i2c_wr16_and_or(sd, CONFCTL, ~(MASK_VBUFEN | MASK_ABUFEN),
++				MASK_VBUFEN | MASK_ABUFEN);
++		mutex_unlock(&state->confctl_mutex);
++	}
+ 	state->lock_since = 0;
+ 	state->nosync_since = 0;
+ 	state->i2c_errs = 0;
+@@ -1979,6 +1991,13 @@ static int tc35874x_s_stream(struct v4l2_subdev *sd, int enable)
+ 		 * 补一个时钟 lane 的 LP11->HS 跳变让它重新同步 */
+ 		i2c_wr32(sd, TXOPTIONCNTRL, 0);
+ 		i2c_wr32(sd, TXOPTIONCNTRL, MASK_CONTCLKMODE);
++		/* "未静音"不能证明 TX 真在跑：self_reset 等路径复位芯片会
++		 * 丢掉 CONFCTL VBUFEN/ABUFEN（2026-10-31 实捕，见 self_reset
++		 * 注释），幂等补回，避免 TX 永久停摆 */
++		mutex_lock(&state->confctl_mutex);
++		i2c_wr16_and_or(sd, CONFCTL, ~(MASK_VBUFEN | MASK_ABUFEN),
++				MASK_VBUFEN | MASK_ABUFEN);
++		mutex_unlock(&state->confctl_mutex);
+ 		state->stream_on = true;
+ 		/* 解静音态下的失锁监控（服务重启后监控可能没在跑） */
+ 		schedule_delayed_work(&state->work_unmute, HZ);
+-- 
+2.43.0
+
