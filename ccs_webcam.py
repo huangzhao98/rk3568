@@ -3074,7 +3074,17 @@ def main():
                             cap.align_conf, cap.align_via = True, 'fast'
                             cap.state = "streaming"
                             cap.last_frame_ts = time.time()
-                            _config_stream(cap, cap.w, cap.h)
+                            if _config_stream(cap, cap.w, cap.h):
+                                # 拔插/信号恢复后这次布防会抢在 TX 出数前
+                                # 完成——按 §27 布防早于 TX 出数相位照样随机
+                                # （2026-10-31 实捕：fast resume 后静态卷
+                                # 368 行，"relock clean 相位必 0"的前提被
+                                # 这次布防自己破坏）。等首帧证明 TX 已流式，
+                                # 二次重启管线按帧头钉 0（同 align 的
+                                # fs_locked 锚点，§27 实测相位恒 0）
+                                f = cap.grab_latest(timeout=5)
+                                if f is not None:
+                                    _config_stream(cap, cap.w, cap.h)
                             raw = None
                             empty = 0
                             continue
