@@ -185,9 +185,13 @@ def probe_matches(data):
 def watch(path):
     """常驻看门狗：EDID RAM 被冲回默认就重写。每 10s 抽查一次
     （开窗口~30ms，DDC 只在插入瞬间被读，抽查对其基本无感）。
-    每拍重读文件：网页端更新 /etc/ccs_edid.bin 后无需重启本服务。"""
+    每拍重读文件：网页端更新 /etc/ccs_edid.bin 后无需重启本服务。
+    连续失败指数退避（2026-11-02 实捕：MS9332 子系统半夜挂死——RAM
+    写不进读回全 0x55，看门狗每 15s 空锤一轮共 7808 轮，DDC 窗口反复
+    开关扰动上游显示枚举；芯片挂死时重写无意义，退避等其恢复）"""
+    fails = 0
     while True:
-        time.sleep(10)
+        time.sleep(10 if fails == 0 else min(30 * fails, 300))
         try:
             data = open(path, 'rb').read()
         except OSError:
@@ -208,12 +212,21 @@ def watch(path):
             except Exception:
                 pass
             lk.close()
+            fails += 1
             continue
         lk.close()
         if not same:
             print('看门狗：EDID 被冲掉，重写', flush=True)
             if apply(path) == 0:
                 hpd_pulse()
+                fails = 0
+            else:
+                fails += 1
+                if fails == 3:
+                    print('看门狗：连续重写失败，转入退避（总线/芯片可能挂死）',
+                          flush=True)
+        else:
+            fails = 0
 
 
 def main():

@@ -147,6 +147,14 @@ systemd 服务 `ccs_webcam.service`）。
 - bit-bang 访问 MS9332 会偶发与 MS8005F 轮询撞车（NACK）——事务级
   重试 5×50ms 兜底；看门狗抽查不匹配必须复核再重写，否则撞车污染的
   读值会造成假"被冲"连环重写（§28b 事故）
+- **MS9332 子系统会整体挂死**（§28k 实捕）：芯片 I2C 应答正常但 EDID
+  RAM 写不进、读回恒 0x55，MS8005F 总线轮询近饱和。此时看门狗重写
+  无意义且开窗扰动上游（空锤 7808 轮把 PC 显示枚举锤到抖动、驱动
+  format_change 风暴把 rkcif 锤进 stream busy）。已加连续失败退避
+  （30s×N 封顶 300s）；恢复手段=停止锤击等几分钟，子系统可自行缓过来
+- **rkcif "stream in busy state" 只能 reboot**：重建管线/芯片复位都
+  无效（问题在 rkcif 内核态不在芯片），gst 报 Failed to allocate
+  required memory 且系统 RAM 充裕时先想这个
 
 ## 换机器后怎么开始工作
 
