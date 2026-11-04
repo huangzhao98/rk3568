@@ -308,9 +308,34 @@ def main():
     if not os.path.exists(IO):
         subprocess.run(['insmod', MOD], check=True)
         time.sleep(0.3)
-    rc = apply(path)
-    if rc == 0:
-        hpd_pulse()
+    # 2026-11-04 改版：先只读抽查，一致就跳过写入+HPD——HPD 脉冲后的
+    # 电脑重新枚举过程实捕会把 MS9332 视频通路打挂（§28m 追加），
+    # 网页端点"应用"时文件刚改过仍会正常写入，不受影响
+    need = True
+    try:
+        data = open(path, 'rb').read()
+        lk = open(LOCK, 'w')
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            window(True)
+            need = not probe_matches(data)
+            window(False)
+        finally:
+            lk.close()
+    except Exception as e:
+        print('WARN: 写入前抽查失败(按需要写入处理): %s' % e, file=sys.stderr,
+              flush=True)
+        try:
+            window(False)
+        except Exception:
+            pass
+    if need:
+        rc = apply(path)
+        if rc == 0:
+            hpd_pulse()
+    else:
+        print('EDID 已一致，跳过写入和 HPD 脉冲', flush=True)
+        rc = 0
     if rc == 0 and '--watch' in sys.argv:
         watch(path)
     return rc
