@@ -182,16 +182,86 @@ def probe_matches(data):
     return True
 
 
+def tmds_present():
+    """读 TC358743 SYS_STATUS(0x8520) bit1=TMDS 在活动。读不到返回 None"""
+    fd = None
+    try:
+        addr = None
+        for d in os.listdir('/sys/bus/i2c/devices'):
+            try:
+                with open('/sys/bus/i2c/devices/%s/name' % d) as f:
+                    if not f.read().strip().startswith('tc35874'):
+                        continue
+                bus, a = d.split('-')
+                fd = os.open('/dev/i2c-%s' % bus, os.O_RDWR)
+                addr = int(a, 16)
+                break
+            except (OSError, ValueError):
+                continue
+        if fd is None:
+            return None
+        w = ctypes.create_string_buffer(bytes([0x85, 0x20]), 2)
+        r = ctypes.create_string_buffer(1)
+        msgs = ctypes.create_string_buffer(
+            struct.pack('<HHH', addr, 0, 2) + b'\0\0' + struct.pack('<Q', ctypes.addressof(w)) +
+            struct.pack('<HHH', addr, 1, 1) + b'\0\0' + struct.pack('<Q', ctypes.addressof(r)), 56)
+        fcntl.ioctl(fd, 0x0707, struct.pack('<QI', ctypes.addressof(msgs), 2))
+        return bool(r.raw[0] & 0x02)
+    except Exception:
+        return None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def watch(path):
-    """常驻看门狗：EDID RAM 被冲回默认就重写。每 10s 抽查一次
-    （开窗口~30ms，DDC 只在插入瞬间被读，抽查对其基本无感）。
-    每拍重读文件：网页端更新 /etc/ccs_edid.bin 后无需重启本服务。
-    连续失败指数退避（2026-11-02 实捕：MS9332 子系统半夜挂死——RAM
-    写不进读回全 0x55，看门狗每 15s 空锤一轮共 7808 轮，DDC 窗口反复
-    开关扰动上游显示枚举；芯片挂死时重写无意义，退避等其恢复）"""
+    """常驻看门狗：EDID RAM 被冲回默认就重写。
+    2026-11-04 事故改版（信号驱动，无信号不再硬锤，§28l 追加实捕）：
+    夜里电脑睡眠后 MS9332 子系统进入病态（RAM 写不进、读回不一致），
+    旧看门狗整夜 20 轮重写+4 次 HPD 脉冲，把它视频通路彻底锤挂。
+    新逻辑：
+    - 无 TMDS（源睡眠/未输出）=静默期：不重写、不 HPD，只每 10 分钟
+      只读抽查一次留证。电脑睡着时 EDID 对错没人在乎，动了反而锤芯片
+    - TMDS 从无到有边沿：校验一次，不一致才重写，重写成功补一个 HPD
+      脉冲让电脑重读（它可能刚按默认 EDID 起了输出）
+    - 有 TMDS 正常期：维持 10s 抽查，被冲就重写+HPD
+    连续失败指数退避保留（§28k）。每拍重读文件：网页端更新无需重启。"""
     fails = 0
+    had_signal = None
+    quiet_checked = 0.0
     while True:
         time.sleep(10 if fails == 0 else min(30 * fails, 300))
+        sig = tmds_present()
+        if not sig:
+            if had_signal:
+                print('看门狗：信号消失，转入静默期（不重写不脉冲）', flush=True)
+            had_signal = False
+            now = time.monotonic()
+            if now - quiet_checked < 600:
+                continue
+            quiet_checked = now
+            try:
+                data = open(path, 'rb').read()
+                lk = open(LOCK, 'w')
+                fcntl.flock(lk, fcntl.LOCK_EX)
+                try:
+                    window(True)
+                    same = probe_matches(data)
+                    window(False)
+                finally:
+                    lk.close()
+                if not same:
+                    print('看门狗：静默期 EDID 不一致，暂不处理（等信号回来）',
+                          flush=True)
+            except Exception as e:
+                print('WARN: 静默期抽查失败: %s' % e, file=sys.stderr, flush=True)
+                try:
+                    window(False)
+                except Exception:
+                    pass
+            continue
+        edge = (had_signal is False)
+        had_signal = True
         try:
             data = open(path, 'rb').read()
         except OSError:
@@ -216,7 +286,8 @@ def watch(path):
             continue
         lk.close()
         if not same:
-            print('看门狗：EDID 被冲掉，重写', flush=True)
+            print('看门狗：EDID 被冲掉，重写%s'
+                  % ('（信号恢复边沿）' if edge else ''), flush=True)
             if apply(path) == 0:
                 hpd_pulse()
                 fails = 0
@@ -226,6 +297,8 @@ def watch(path):
                     print('看门狗：连续重写失败，转入退避（总线/芯片可能挂死）',
                           flush=True)
         else:
+            if edge:
+                print('看门狗：信号恢复，EDID 一致无需动作', flush=True)
             fails = 0
 
 
