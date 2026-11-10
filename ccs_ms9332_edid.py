@@ -214,21 +214,27 @@ def tmds_present():
             os.close(fd)
 
 
-def watch(path):
+def watch(path, last_hpd=0.0):
     """常驻看门狗：EDID RAM 被冲回默认就重写。
     2026-11-04 事故改版（信号驱动，无信号不再硬锤，§28l 追加实捕）：
     夜里电脑睡眠后 MS9332 子系统进入病态（RAM 写不进、读回不一致），
     旧看门狗整夜 20 轮重写+4 次 HPD 脉冲，把它视频通路彻底锤挂。
-    新逻辑：
-    - 无 TMDS（源睡眠/未输出）=静默期：不重写、不 HPD，只每 10 分钟
-      只读抽查一次留证。电脑睡着时 EDID 对错没人在乎，动了反而锤芯片
+    2026-11-10 再改版（§28n 实捕）：静默期"完全不写"会死锁——EDID
+    在凌晨被冲坏，电脑醒来读到坏 EDID（校验和不过）拒绝输出 → TMDS
+    永远不来 → 恢复边沿永远不触发 → 整天无信号。新逻辑：
+    - 无 TMDS = 静默期：不打 HPD（电脑睡着脉冲无用且诱发挂死），
+      每 10 分钟只读抽查；发现被冲**单次重写**（睡着时重写最安全，
+      没人在读），失败则 30 分钟内不再试（防 §28k 式锤击）
     - TMDS 从无到有边沿：校验一次，不一致才重写，重写成功补一个 HPD
-      脉冲让电脑重读（它可能刚按默认 EDID 起了输出）
+      脉冲让电脑重读（它可能刚按坏/默认 EDID 起了输出或拒绝输出）
     - 有 TMDS 正常期：维持 10s 抽查，被冲就重写+HPD
+    - HPD 脉冲全程限频 120s（含 main() 启动那次）：开机竞态实测
+      13s 内双脉冲，密集脉冲是挂死诱因（§28e/§28m）
     连续失败指数退避保留（§28k）。每拍重读文件：网页端更新无需重启。"""
     fails = 0
     had_signal = None
     quiet_checked = 0.0
+    quiet_fix_failed = 0.0
     while True:
         time.sleep(10 if fails == 0 else min(30 * fails, 300))
         sig = tmds_present()
@@ -251,8 +257,19 @@ def watch(path):
                 finally:
                     lk.close()
                 if not same:
-                    print('看门狗：静默期 EDID 不一致，暂不处理（等信号回来）',
-                          flush=True)
+                    now2 = time.monotonic()
+                    if now2 - quiet_fix_failed < 1800:
+                        print('看门狗：静默期 EDID 不一致，上次重写失败未满30分钟，'
+                              '暂不处理', flush=True)
+                    else:
+                        print('看门狗：静默期 EDID 被冲，单次重写（不打 HPD）',
+                              flush=True)
+                        if apply(path) == 0:
+                            quiet_fix_failed = 0.0
+                            print('看门狗：静默期重写成功，等信号恢复', flush=True)
+                        else:
+                            quiet_fix_failed = now2
+                            print('看门狗：静默期重写失败，30分钟后再试', flush=True)
             except Exception as e:
                 print('WARN: 静默期抽查失败: %s' % e, file=sys.stderr, flush=True)
                 try:
@@ -289,7 +306,13 @@ def watch(path):
             print('看门狗：EDID 被冲掉，重写%s'
                   % ('（信号恢复边沿）' if edge else ''), flush=True)
             if apply(path) == 0:
-                hpd_pulse()
+                # HPD 脉冲限频 120s（§28n：开机竞态曾 13s 内双脉冲，
+                # 密集脉冲是 MS9332 挂死诱因 §28e/§28m）；重写照做只限脉冲
+                if time.monotonic() - last_hpd >= 120:
+                    hpd_pulse()
+                    last_hpd = time.monotonic()
+                else:
+                    print('看门狗：120s 内已脉冲过，本次只重写不脉冲', flush=True)
                 fails = 0
             else:
                 fails += 1
@@ -312,6 +335,7 @@ def main():
     # 电脑重新枚举过程实捕会把 MS9332 视频通路打挂（§28m 追加），
     # 网页端点"应用"时文件刚改过仍会正常写入，不受影响
     need = True
+    pulsed_at = 0.0
     try:
         data = open(path, 'rb').read()
         lk = open(LOCK, 'w')
@@ -333,11 +357,12 @@ def main():
         rc = apply(path)
         if rc == 0:
             hpd_pulse()
+            pulsed_at = time.monotonic()
     else:
         print('EDID 已一致，跳过写入和 HPD 脉冲', flush=True)
         rc = 0
     if rc == 0 and '--watch' in sys.argv:
-        watch(path)
+        watch(path, pulsed_at)
     return rc
 
 
