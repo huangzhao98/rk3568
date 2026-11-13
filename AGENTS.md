@@ -152,6 +152,10 @@ systemd 服务 `ccs_webcam.service`）。
   无意义且开窗扰动上游（空锤 7808 轮把 PC 显示枚举锤到抖动、驱动
   format_change 风暴把 rkcif 锤进 stream busy）。已加连续失败退避
   （30s×N 封顶 300s）；恢复手段=停止锤击等几分钟，子系统可自行缓过来
+- **MS9332 视频通路挂死（§28l/§28m/§28n/§28o，7 次实捕）只能断电**：
+  电脑睡眠供电瞬变诱发（3 天零接触也自毁），挂死后 self_reset、
+  寄存器写回（差异区只读）、HPD 脉冲/长拉低、整机 reboot 全部无效，
+  唯一恢复=拔电源。根治=硬件改版加复位/电源控制线
 - **rkcif "stream in busy state" 只能 reboot**：重建管线/芯片复位都
   无效（问题在 rkcif 内核态不在芯片），gst 报 Failed to allocate
   required memory 且系统 RAM 充裕时先想这个
