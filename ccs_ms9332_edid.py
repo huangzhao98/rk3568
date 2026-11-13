@@ -182,6 +182,35 @@ def probe_matches(data):
     return True
 
 
+def probe_flushed(data):
+    """多采样复核"真被冲"：≥3/4 次读不一致，且坏内容稳定（至少两次
+    读到相同的错误头）才认定。bit-bang 与 MS8005F 轮询撞车会读出随机
+    垃圾（实测 5 连读 2 次垃圾），旧逻辑只复核一次，撞车叠加会误判
+    触发重写——重写本身又是 16 笔 bit-bang 写，每笔都是撞车风险敞口。
+    真被冲（全 0 / 默认 EDID）内容稳定，撞车垃圾每次随机，极少两次
+    相同。有任何一次读到正确内容立即判没坏（最常见情形，省时）。"""
+    heads = []
+    for i in range(4):
+        if i:
+            time.sleep(0.2)
+        try:
+            h = rd(0x00, 0x0d, 16)
+        except Exception:
+            continue                    # NACK 撞车不算证据
+        if h == data[:16]:
+            return False
+        heads.append(h)
+    if len(heads) < 3:
+        return False
+    for i in range(len(heads)):
+        for j in range(i + 1, len(heads)):
+            if heads[i] == heads[j]:
+                return True
+    print('看门狗：%d 次抽查不一致但内容互不相同，判为撞车垃圾，不重写'
+          % len(heads), flush=True)
+    return False
+
+
 def tmds_present():
     """读 TC358743 SYS_STATUS(0x8520) bit1=TMDS 在活动。读不到返回 None"""
     fd = None
@@ -228,6 +257,9 @@ def watch(path, last_hpd=0.0):
     - TMDS 从无到有边沿：校验一次，不一致才重写，重写成功补一个 HPD
       脉冲让电脑重读（它可能刚按坏/默认 EDID 起了输出或拒绝输出）
     - 有 TMDS 正常期：维持 10s 抽查，被冲就重写+HPD
+      （"被冲"认定走 probe_flushed 多采样复核：≥3/4 次不一致且坏内容
+      稳定才算——2026-11-13 实捕连读 5 次 2 次撞车垃圾，旧单复核会
+      误判触发重写，重写本身又是 16 笔 bit-bang 写的撞车敞口）
     - HPD 脉冲全程限频 120s（含 main() 启动那次）：开机竞态实测
       13s 内双脉冲，密集脉冲是挂死诱因（§28e/§28m）
     连续失败指数退避保留（§28k）。每拍重读文件：网页端更新无需重启。"""
@@ -252,7 +284,7 @@ def watch(path, last_hpd=0.0):
                 fcntl.flock(lk, fcntl.LOCK_EX)
                 try:
                     window(True)
-                    same = probe_matches(data)
+                    same = not probe_flushed(data)
                     window(False)
                 finally:
                     lk.close()
@@ -287,10 +319,7 @@ def watch(path, last_hpd=0.0):
         fcntl.flock(lk, fcntl.LOCK_EX)
         try:
             window(True)
-            same = probe_matches(data)
-            if not same:
-                time.sleep(0.15)               # 读值可能被撞车污染，复核再定
-                same = probe_matches(data)
+            same = not probe_flushed(data)
             window(False)
         except Exception as e:
             print('WARN: 看门狗抽查失败: %s' % e, file=sys.stderr, flush=True)
